@@ -1,0 +1,27 @@
+{
+  "name": "alexa-ai",
+  "version": "1.0.0",
+  "description": "Object-oriented DeepAI-powered AI engine for the Alexa WhatsApp bot, with PostgreSQL-backed user management and long-term memory.",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test/run-tests.js",
+    "demo": "node examples/demo.js",
+    "migrate": "node -e \"require('./index').AlexaAI.migrate(process.env.POSTGRES_URL).then(()=>{console.log('migrated');process.exit(0)}).catch(e=>{console.error(e);process.exit(1)})\""
+  },
+  "keywords": [
+    "whatsapp",
+    "ai",
+    "deepai",
+    "postgres",
+    "chatbot",
+    "alexa"
+  ],
+  "author": "Hansaka",
+  "license": "ISC",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}
