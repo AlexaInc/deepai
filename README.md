@@ -215,7 +215,8 @@ AlexaAI                     orchestrator; the only class the bot touches
 ├── MemoryExtractor         parses & strips the @MEMORY tag
 ├── FactMiner               local fallback fact extraction
 ├── ResponseFormatter       enforces WhatsApp formatting; chunks long replies
-├── ImageDescriber          vision path (see limitation)
+├── IdentityGuard           keeps Alexa in character (no vendor leaks)
+├── ImageDescriber          vision chain: DeepAI -> OCR -> honest fallback
 └── JidParser               normalises @lid / @s.whatsapp.net / @g.us
 ```
 
@@ -333,33 +334,131 @@ hacker_is_stinky = very_stinky
 
 ---
 
-## Known limitation: image vision
+## Images & documents
 
-**Vision does not work on free `tryit-` keys.** This was tested exhaustively:
+Attachments run through a **provider chain** — first success wins:
 
-| approach                             | result                                                                    |
-| ------------------------------------ | ------------------------------------------------------------------------- |
-| Upload + `attachment_uuids`          | `"The selected model (llama-3.1-8b-instruct-turbo) does not support image attachments."` |
-| Force `gpt-4o-mini` / `gemini-*`     | same error — anonymous keys are downgraded server-side                    |
-| Vision models (`gpt-4.1`, Genius)    | `"Only paid accounts can use genius"`                                     |
-| base64 data-URI in the message       | `"It appears to be an image pattern encoded in base64."`                  |
-| public image URL                     | model **guesses from the URL**, it cannot actually see the image          |
+| # | Provider | Handles | Works on free key? |
+|---|----------|---------|--------------------|
+| 0 | **DeepAI document extraction** | `.txt` `.pdf` `.docx` `.csv` `.md` … | ✅ yes |
+| 1 | **DeepAI native vision** | full understanding of any photo | ❌ paid only |
+| 2 | **OCR** (`ocr.space`) | text inside images/screenshots | ✅ yes |
+| 3 | Honest fallback | photos with no text | ✅ yes |
 
-The URL test is worth calling out: a dog photo produced a plausible
-*"Afghan Hound"*, which looks like working vision — but an image containing the
-text `SECRET CODE: ZQ7412` at a neutral URL produced *"I can't read or repeat the
-code in an image."* The model was inferring from filenames, not seeing pixels.
+The engine follows the browser's exact sequence — `upload` → `get` → `chat` —
+and reads `extraction_status` from the `get` response to decide what to do:
 
-`ImageDescriber` therefore:
+```
+.txt  -> extraction_status: complete   ← contents injected into the model ✅
+.pdf  -> extraction_status: failed/complete
+.png  -> extraction_status: skipped    ← nothing injected (needs paid vision)
+```
 
-1. tries the real upload + attachment flow first,
-2. detects the plan refusal and latches vision off to avoid wasted calls,
-3. returns an honest fallback (*"I'm not able to view images right now — could
-   you describe it?"*) instead of hallucinating a description.
+### Why native image vision needs a paid key
 
-**The code is complete and correct** — supply a paid DeepAI key (or set
-`visionModel: 'gpt-4.1'` on a Pro account) and vision starts working with no
-changes.
+This was probed exhaustively against the live API. The decisive test: request a
+**model that does not exist**.
+
+```
+requested "gpt-4o-mini"        -> resolves to llama-3.1-8b-instruct-turbo
+requested "gemini-2.5-flash"   -> resolves to llama-3.1-8b-instruct-turbo
+requested "totally-fake-model" -> resolves to llama-3.1-8b-instruct-turbo
+```
+
+The `model` field is **ignored entirely** once an attachment is present. Yet for
+plain text on the very same key, routing works correctly:
+
+```
+text-only, model=gpt-4o-mini   -> "I am GPT-4o mini."   ✅
+```
+
+So the downgrade is attachment-specific, not key- or transport-specific. It was
+reproduced with a UA-matched generated key, with a signed-in `sessionid`, with a
+freshly issued `deepai_device_id`, with the full browser field set
+(`session_uuid`, `sensitivity_request_id`, `tool_activity_support`,
+`thinking_image_tool_support`, `enabled_tools`), and with the exact key + cookies
+from a working browser capture. Every combination returned the same refusal.
+
+DeepAI itself states the reason in one reply:
+
+> *"The user attached the following files, but neither native vision nor
+> document text extraction added their contents to this model request."*
+
+One genuine bug **was** found and fixed along the way: putting
+`attachment_uuids` **inside the message object** forces the downgrade, while
+sending it only as a top-level form field keeps the chosen model selected. The
+client now does the latter.
+
+### What you get today
+
+```js
+// screenshot / any image containing text  -> OCR
+ai({ text: 'what does this say?', files: [buffer] }, userId, groupId, name)
+// -> "SECRETCODE: ZQ7412 / Banana Elephant 88"
+
+// document -> real server-side extraction
+ai({ text: 'what is the total?', files: [{ buffer, mimetype: 'text/plain', filename: 'note.txt' }] }, ...)
+// -> "`Total: 4500 LKR, Due date: 2026-10-01`"
+
+// photo with no text -> honest, never invented
+// -> "I'm not able to view pictures right now 🙏 Could you tell me what it shows?"
+```
+
+The moment you add a paid DeepAI key, `extraction_status` stops returning
+`skipped`, provider #1 succeeds, and full vision turns on with **no code
+change**.
+
+```js
+new AlexaAI({
+  key, postgresUrl,
+  ocr: true,                 // default; false to disable OCR
+  ocrApiKey: 'your-key',     // default 'helloworld' (shared demo key)
+  visionModel: 'gpt-4o-mini' // bump to 'gpt-4.1' on a paid plan
+});
+```
+
+> **Tip:** the default OCR key is a shared demo key and is rate-limited. Get a
+> free one at [ocr.space/ocrapi](https://ocr.space/ocrapi) and set `OCR_API_KEY`.
+
+### Accepted `files[0]` formats
+
+Buffer · data URI · raw base64 · http(s) URL · local path · `{ buffer, mimetype, filename }`
+
+> ⚠️ Pass `content` as a **plain string**. DeepAI rejects OpenAI-style array
+> content (`[{type:'text'},{type:'image_url'}]`) with HTTP 500 — even when the
+> array holds only text. Use `{ text, files: [...] }`.
+
+---
+
+## Identity lock
+
+DeepAI injects its own identity server-side, which overrides the persona. Live,
+before the fix:
+
+```
+"what is your name?"  -> "I am Standard AI Chat by DeepAI."
+"who created you?"    -> "I was created by DeepAI..."
+"are you ChatGPT?"    -> "I am Standard AI Chat by DeepAI, not ChatGPT."
+```
+
+Few-shot examples did **not** help (5/6 still leaked). `IdentityGuard` fixes it
+with two layers:
+
+1. **Pre-flight** — an identity question gets a short *IDENTITY LOCK* hint
+   injected right above it.
+2. **Post-flight** — every reply is scrubbed of `DeepAI`, `ChatGPT`, `OpenAI`,
+   `GPT-*`, `Llama`, `Claude`, `Gemini`, "large language model", etc., so a
+   vendor name can never reach the user even if volunteered unprompted.
+
+Result — **0/7 leaks**:
+
+```
+are you alexa?        -> *Yes, I am Alexa, created by Hansaka.*
+what is your name?    -> My name is Alexa, made by Hansaka.
+who created you?      -> I was created by Hansaka.
+what model are you?   -> I am Alexa, made by Hansaka.
+are you ChatGPT?      -> I am Alexa, made by Hansaka.
+```
 
 ---
 
@@ -376,7 +475,7 @@ POSTGRES_URL=postgres://postgres:pass@localhost:5432/alexa node test/run-tests.j
 POSTGRES_URL=... DEEPAI_KEY=tryit-... node test/run-tests.js
 ```
 
-**142 assertions, all passing** against a real PostgreSQL 17 instance and the
+**165 assertions, all passing** against a real PostgreSQL 17 instance and the
 live DeepAI API — covering jid parsing, memory extraction from malformed model
 output, trigger matching, formatting enforcement, cross-group memory recall,
 per-user isolation, message dedupe, and history windowing.

@@ -17,6 +17,7 @@ const {
     MemoryExtractor,
     FactMiner,
     MathDetector,
+    IdentityGuard,
     ResponseFormatter,
     TriggerDetector,
     MemoryRepository,
@@ -159,6 +160,35 @@ check('stringifies object value', MemoryRepository.normalizeValue({ a: 1 }), '{"
 check('rejects null value', MemoryRepository.normalizeValue(null), null);
 ok('truncates very long value', MemoryRepository.normalizeValue('x'.repeat(9999)).length === 512);
 
+
+
+// ==========================================================================
+section('IdentityGuard — Alexa never reveals the backend vendor');
+// ==========================================================================
+ok('detects "are you alexa?"', IdentityGuard.isIdentityQuestion('are you alexa?'));
+ok('detects "what is your name?"', IdentityGuard.isIdentityQuestion('what is your name?'));
+ok('detects "who created you?"', IdentityGuard.isIdentityQuestion('who created you?'));
+ok('detects "what model are you?"', IdentityGuard.isIdentityQuestion('what model are you?'));
+ok('detects "are you ChatGPT?"', IdentityGuard.isIdentityQuestion('are you ChatGPT?'));
+ok('detects "which company made you"', IdentityGuard.isIdentityQuestion('which company made you'));
+ok('ignores normal chat', !IdentityGuard.isIdentityQuestion('what is the weather today'));
+ok('hint added for identity question', IdentityGuard.hintFor('who made you?').includes('IDENTITY LOCK'));
+check('no hint for normal chat', IdentityGuard.hintFor('hello'), '');
+check(
+    'replaces a leaked identity answer',
+    IdentityGuard.sanitise('I am Standard AI Chat by DeepAI.', true),
+    'I am *Alexa*, your WhatsApp assistant created by *Hansaka*. \u{1F60A}'
+);
+ok(
+    'scrubs vendor name mid-sentence',
+    !/deepai/i.test(IdentityGuard.sanitise('Sure! DeepAI can help with that.', false))
+);
+ok(
+    'scrubs "large language model"',
+    !/language model/i.test(IdentityGuard.sanitise("I'm a large language model, here to help.", false))
+);
+check('leaves clean replies untouched', IdentityGuard.sanitise('The weather is sunny today.', false), 'The weather is sunny today.');
+ok('no ChatGPT leak survives', !/chatgpt/i.test(IdentityGuard.sanitise('I am ChatGPT, how can I help?', false)));
 
 // ==========================================================================
 section('MathDetector — concise math answers');

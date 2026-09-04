@@ -78,6 +78,16 @@ class Config {
         this.maxMessageLength = Config._int(opts.maxMessageLength, 8000, 100, 100000);
         this.sharedGroupThread = Boolean(opts.sharedGroupThread);
 
+        // ---- Vision / OCR ----------------------------------------------------
+        // DeepAI's own vision needs a PAID key (free 'tryit' keys are
+        // downgraded to a text-only model), so OCR is used as a fallback to
+        // read screenshots, documents and error messages.
+        this.ocrEnabled = opts.ocr !== false;
+        this.ocrUrl = opts.ocrUrl || 'https://api.ocr.space/parse/image';
+        this.ocrApiKey = opts.ocrApiKey || process.env.OCR_API_KEY || 'helloworld';
+        this.ocrLanguage = opts.ocrLanguage || 'eng';
+        this.ocrTimeout = Config._int(opts.ocrTimeout, 25000, 1000, 120000);
+
         // ---- Networking ------------------------------------------------------
         this.timeout = Config._int(opts.timeout, 60000, 1000, 600000);
         this.maxRetries = Config._int(opts.maxRetries, 2, 0, 10);

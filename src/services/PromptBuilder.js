@@ -1,6 +1,7 @@
 'use strict';
 
 const MathDetector = require('./MathDetector');
+const IdentityGuard = require('./IdentityGuard');
 
 /**
  * PromptBuilder
@@ -86,7 +87,15 @@ class PromptBuilder {
         // question; the free-tier model otherwise emits a full derivation.
         const mathHint = MathDetector.isMath(current) ? MathDetector.HINT : '';
 
-        messages.push({ role: 'user', content: recallNote + mathHint + (current || '(empty message)') });
+        // DeepAI injects its own identity server-side ("Standard AI Chat by
+        // DeepAI"), which overrides the persona. A lock next to the question
+        // is the only thing that reliably keeps Alexa in character.
+        const idHint = IdentityGuard.hintFor(current);
+
+        messages.push({
+            role: 'user',
+            content: recallNote + idHint + mathHint + (current || '(empty message)'),
+        });
 
         return messages;
     }

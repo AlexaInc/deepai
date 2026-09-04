@@ -78,7 +78,13 @@ class DeepAIClient {
         form.append('hacker_is_stinky', 'very_stinky');
 
         if (Array.isArray(options.attachmentUuids) && options.attachmentUuids.length) {
+            // Mirror the browser's exact field set for attachment requests.
             form.append('attachment_uuids', JSON.stringify(options.attachmentUuids));
+            form.append('session_uuid', options.sessionUuid || DeepAIClient._uuid());
+            form.append('sensitivity_request_id', DeepAIClient._uuid());
+            form.append('tool_activity_support', '1');
+            form.append('thinking_image_tool_support', '1');
+            form.append('enabled_tools', JSON.stringify(['image_generator', 'image_editor']));
         }
 
         const controller = new AbortController();
@@ -201,6 +207,34 @@ class DeepAIClient {
     }
 
     /**
+     * Poll an attachment until server-side extraction finishes.
+     * Images normally return `skipped` (vision is a paid feature); documents
+     * return `complete` and their text IS injected into the model context.
+     * @param {string} uuid
+     * @param {number} [attempts=3]
+     * @returns {Promise<object|null>}
+     */
+    async getAttachment(uuid, attempts = 3) {
+        for (let i = 0; i < attempts; i++) {
+            try {
+                const response = await fetch(
+                    `${this.config.baseUrl}/chat_attachments/get?uuid=${encodeURIComponent(uuid)}`,
+                    { headers: { Origin: 'https://deepai.org', Referer: 'https://deepai.org/' } }
+                );
+                const data = await response.json();
+                const status = data?.attachment?.extraction_status;
+                if (data?.success && status !== 'pending' && status !== 'processing') {
+                    return data.attachment;
+                }
+            } catch {
+                /* retry */
+            }
+            await DeepAIClient._sleep(1200);
+        }
+        return null;
+    }
+
+    /**
      * DeepAI signals refusals with a small JSON body `{"status": "..."}`.
      * A normal reply is plain prose, so only treat *short* JSON as a status.
      * @private
@@ -242,6 +276,15 @@ class DeepAIClient {
             status,
             body: body?.slice?.(0, 500),
             retryable,
+        });
+    }
+
+    /** @private RFC4122 v4, without pulling in a dependency. */
+    static _uuid() {
+        if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+            const r = (Math.random() * 16) | 0;
+            return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
         });
     }
 

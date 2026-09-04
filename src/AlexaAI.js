@@ -10,6 +10,7 @@ const PromptBuilder = require('./services/PromptBuilder');
 const MemoryExtractor = require('./services/MemoryExtractor');
 const FactMiner = require('./services/FactMiner');
 const ResponseFormatter = require('./services/ResponseFormatter');
+const IdentityGuard = require('./services/IdentityGuard');
 const TriggerDetector = require('./services/TriggerDetector');
 const ImageDescriber = require('./services/ImageDescriber');
 const JidParser = require('./utils/JidParser');
@@ -206,15 +207,15 @@ class AlexaAI {
             const described = await this.vision.describe(image, message);
             if (described.ok) {
                 imageContext = described.description;
-            } else if (!message) {
-                // Image with no caption and no vision: answer honestly rather
-                // than letting the model invent a description.
+            } else {
+                // Nothing could be read from the image. Be honest instead of
+                // letting the model invent a description.
                 const fallback = ImageDescriber.fallbackMessage(message);
                 await this.conversations.addMessage({
                     conversationId: conversation.id,
                     userId: user.id,
                     role: 'user',
-                    content: '[image]',
+                    content: message || '[image]',
                     hasMedia: true,
                     mediaType: image.mimetype || 'image',
                     waMessageId: messageId,
@@ -296,6 +297,10 @@ class AlexaAI {
         // ---- extract memories, then format --------------------------------
         const extracted = MemoryExtractor.extract(rawReply);
         let finalText = ResponseFormatter.format(extracted.text);
+
+        // Scrub any vendor/model name the backend volunteered, so Alexa never
+        // introduces herself as "Standard AI Chat by DeepAI".
+        finalText = IdentityGuard.sanitise(finalText, IdentityGuard.isIdentityQuestion(message));
 
         // Guarantee no @MEMORY remnant ever reaches WhatsApp.
         if (/@\s*MEMORY/i.test(finalText)) finalText = MemoryExtractor.strip(finalText);

@@ -32,7 +32,8 @@ class ResponseFormatter {
         text = text
             .replace(/^\s*\[Remembered facts about this person[^\]]*\]\s*/gim, '')
             .replace(/^\s*\[Image attached[^\]]*\]\s*/gim, '')
-            .replace(/^\s*\[MATH MODE:[^\]]*\]\s*/gim, '');
+            .replace(/^\s*\[MATH MODE:[^\]]*\]\s*/gim, '')
+            .replace(/^\s*\[IDENTITY LOCK:[^\]]*\]\s*/gim, '');
 
         // --- protect fenced code blocks ------------------------------------
         const blocks = [];
