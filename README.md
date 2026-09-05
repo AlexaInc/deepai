@@ -35,9 +35,21 @@ await sock.sendMessage(jid, { text });       // your WhatsApp layer
 - [Architecture](#architecture)
 - [Configuration](#configuration)
 - [User management API](#user-management-api)
-- [Verified DeepAI API behaviour](#verified-deepai-api-behaviour)
-- [Known limitation: image vision](#known-limitation-image-vision)
+- [The whole DeepAI API, not just the chat endpoint](#the-whole-deepai-api-not-just-the-chat-endpoint)
+- [Images & documents](#images--documents)
+- [Identity lock](#identity-lock)
 - [Testing](#testing)
+
+### What was fixed in this release
+
+| symptom | cause | fix |
+| ------- | ----- | --- |
+| "as a bot I can't remember" in groups, while the DM knew everything | WhatsApp addresses the same person as `@lid` in groups and as a phone jid in DMs → two `wa_users` rows | `wa_user_identities` alias graph + automatic row merging (`aliases`, `linkIdentity()`) |
+| the model still denied remembering | free-tier boilerplate overriding the facts in the prompt | `[MEMORY CHECK]` directive + `AmnesiaGuard`, which rewrites the denial from the database |
+| "I'm Alexa Mini, not Alexa" | DeepAI renames the persona with its own model tier | `[IDENTITY RULES]` in the persona, a sharper identity lock, and post-flight repair of variants/denials |
+| control characters, JSON blobs and chain-of-thought in replies | the chat body is a packet stream, not prose | `StreamParser` |
+| only one endpoint was ever called | – | the full endpoint surface: tasks, attachments, sessions, settings, `/api/*` |
+| photos were a coin flip | one vision model, permanently latched off after one refusal | vision model chain, cooldown instead of latch, attachment passthrough to the real conversation, base64/URL inputs |
 
 ---
 
@@ -72,13 +84,25 @@ POSTGRES_URL=... npm run migrate
 | ----------- | ----------------- | -------- | -------------------------------------------------- |
 | `message`   | `string`          | ✔\*      | the user's text                                     |
 | `userId`    | `string`          | ✔        | `78151912841263@lid` or `947...@s.whatsapp.net`     |
+| `userLid`   | `string`          | –        | the sender's `@lid` address, if you know it        |
+| `userPhone` | `string`          | –        | phone jid **or** bare number behind the `@lid`     |
+| `aliases`   | `string[]`        | –        | any other address for the same human               |
 | `groupId`   | `string`          | –        | `120363413125431525@g.us`; omit/empty for a DM      |
 | `userName`  | `string`          | –        | WhatsApp push name                                  |
 | `groupName` | `string`          | –        | group subject                                       |
-| `image`     | `object`          | –        | `{ buffer, mimetype, filename }` — see limitation   |
+| `image`     | `object`          | –        | `{ buffer \| url \| base64, mimetype, filename }`    |
 | `messageId` | `string`          | –        | WhatsApp message id, used to de-duplicate           |
 | `isAdmin`   | `boolean`         | –        | sender is a group admin                             |
+| `model`     | `string`          | –        | override the DeepAI model for this turn            |
+| `webAccess` | `boolean`         | –        | let DeepAI search the web for this turn            |
+| `thinking`  | `boolean`         | –        | use the async reasoning path (`thinking_support`)  |
+| `onToken`   | `function`        | –        | `(delta, full)` streaming callback                 |
 | `signal`    | `AbortSignal`     | –        | cancel an in-flight request                         |
+
+> **Pass every address you have.** WhatsApp calls the same person
+> `947…@s.whatsapp.net` in a DM and `781…@lid` in a group — supplying both
+> (Baileys: `key.participant` + `key.participantAlt`) is what makes Alexa
+> recognise a DM user inside a group. See [Identity](#how-identity--memory-work).
 
 \* required unless an `image` is supplied.
 
@@ -93,6 +117,12 @@ Returns:
   isGroup   : false,
   contextKey: 'dm:78151912841263@lid',
   userName  : 'Nimal',
+  userId    : 42,            // the canonical person behind every alias
+  aliases   : ['78151912841263@lid', '94771234567@s.whatsapp.net'],
+  mergedIdentities: false,   // true when two rows were folded into one
+  repairedMemory  : false,   // true when an "I can't remember" denial was fixed
+  images    : [],            // urls when the model used its image tool
+  model     : 'standard',    // the model that actually answered
   latencyMs : 1420,
   chunks    : ['...'],       // pre-split for WhatsApp's length cap
   error     : null           // 'user_blocked' | 'DEEPAI_QUOTA_EXCEEDED' | ...
@@ -133,23 +163,64 @@ message shape.
 This is the part that satisfies *"identify the same user across DMs and any
 group"*.
 
-```
-                    ┌──────────────────────────┐
-                    │  wa_users                │
- 78151912841263@lid │  ONE row per human       │
-        ──────────► │  id = 42                 │ ◄──── same row from every group
-                    └────────────┬─────────────┘
-                                 │ user_id
-                    ┌────────────▼─────────────┐
-                    │  wa_memories             │   ← keyed to the USER only,
-                    │  (user_id, key) UNIQUE   │     never to a group
-                    └──────────────────────────┘
+### The bug: WhatsApp gives one human two addresses
 
-  conversations are separate so chat context never bleeds between rooms:
-     dm:78151912841263@lid
-     group:120363413125431525@g.us:78151912841263@lid
-     group:120363999888777666@g.us:78151912841263@lid
+This is why the bot used to answer *"unfortunately, as a bot I can't remember"*
+the moment a known user spoke in a group:
+
 ```
+DM      ->  key.remoteJid    = 94771234567@s.whatsapp.net     row #1  (knows everything)
+GROUP   ->  key.participant  = 78151912841263@lid             row #2  (knows nothing)
+```
+
+Same person, two rows, two memory sets. LID addressing is now the default for
+groups, so this hits **every** user.
+
+### The fix: an alias graph
+
+```
+   94771234567@s.whatsapp.net ─┐
+   78151912841263@lid ─────────┤   wa_user_identities        ┌────────────────────┐
+   94771234567:12@s.whatsapp.net┤   (jid -> user_id)   ─────►│ wa_users  id = 42  │
+   …any future address ────────┘                             └─────────┬──────────┘
+                                                                       │ user_id
+                                                          ┌────────────▼─────────────┐
+                                                          │  wa_memories             │
+                                                          │  (user_id, key) UNIQUE   │
+                                                          └──────────────────────────┘
+
+  conversations stay separate so chat context never bleeds between rooms
+  (keyed on the person's canonical address, so they survive an address change):
+     dm:94771234567@s.whatsapp.net
+     group:120363413125431525@g.us:94771234567@s.whatsapp.net
+     group:120363999888777666@g.us:94771234567@s.whatsapp.net
+```
+
+Pass every address you have and the engine links them — and **merges** rows that
+turn out to be the same human, moving memories, transcripts and group
+membership onto the surviving row:
+
+```js
+// Baileys gives you both on a group message
+const sender    = msg.key.participant || msg.key.remoteJid;      // 781…@lid
+const senderAlt = msg.key.participantAlt || msg.key.participantPn; // 947…@s.whatsapp.net
+
+await ai.chat({
+    message: text,
+    userId: sender,
+    aliases: [senderAlt],       // ← one line; this is the whole fix
+    groupId: msg.key.remoteJid,
+    userName: msg.pushName,
+});
+
+// or teach the mapping once, whenever you learn it
+await ai.linkIdentity('78151912841263@lid', '94771234567@s.whatsapp.net');
+await ai.getAliases('78151912841263@lid');  // both addresses
+await ai.whoIs('94771234567@s.whatsapp.net'); // { user, aliases, memories }
+```
+
+If you never pass an alias nothing breaks — the engine simply behaves as before,
+one row per address.
 
 - **Memories are global per user.** A fact learned in a DM is available in
   every group, and vice-versa.
@@ -161,6 +232,12 @@ group"*.
   `NULL` for those users.
 - Device suffixes are stripped, so `94771234567:12@s.whatsapp.net` and
   `94771234567@s.whatsapp.net` are the same person.
+- **A jid can only belong to one human.** If an address shows up under a second
+  user, the rows are merged (oldest wins, newest fact value wins per key).
+- **The model can no longer deny it.** Even with the facts in the prompt, the
+  free tier sometimes replies *"as a bot I can't remember"*. `AmnesiaGuard`
+  detects that sentence, and if the database disagrees it rewrites the answer
+  from the stored facts — deterministically, with no extra API call.
 
 Verified end-to-end against a live database and the live API:
 
@@ -179,12 +256,13 @@ Verified end-to-end against a live database and the live API:
 
 ## Database schema
 
-Seven tables, all created automatically. Full DDL in
+Eight tables, all created automatically. Full DDL in
 [`src/db/schema.sql`](src/db/schema.sql).
 
 | table              | purpose                                                            |
 | ------------------ | ------------------------------------------------------------------ |
 | `wa_users`         | one row per person; `jid` unique; push name, counters, block flag  |
+| `wa_user_identities` | every address a person is seen under -> one `user_id` (`@lid` ↔ phone) |
 | `wa_groups`        | one row per group; subject, per-group AI on/off switch             |
 | `wa_group_members` | which user was seen in which group (per-room stats, admin flag)    |
 | `wa_conversations` | one thread per DM / per (group, user); `context_key` unique        |
@@ -204,23 +282,32 @@ Every responsibility is its own class — the object-oriented requirement.
 ```
 AlexaAI                     orchestrator; the only class the bot touches
 ├── Config                  validated settings, env fallbacks, redacted logging
-├── DeepAIClient            HTTP transport: retries, timeouts, error mapping
+├── Endpoints               every DeepAI route in one overridable map
+├── DeepAIClient            full DeepAI transport: chat, tasks, attachments,
+│                           sessions, settings, /api/* — retries + key rotation
+├── StreamParser            splits DeepAI's stream: text | tool activity |
+│                           web results | generated images | chain-of-thought
+├── Persona / SystemPrompt  the Alexa prompt, renameable per deployment
 ├── Database                pg pool, migrations, transactions
 ├── UserRepository          users, groups, membership, blocking
+├── IdentityRepository      the alias graph (@lid ↔ phone) + row merging
 ├── MemoryRepository        long-term facts (global per user)
 ├── ConversationRepository  threads, messages, history windows, usage log
-├── PromptBuilder           assembles chatHistory (persona + memory + history)
+├── IdentityResolver        "which human is this?" across every address
+├── PromptBuilder           assembles chatHistory (system + persona + memory)
 ├── TriggerDetector         deterministic weather/menu/ping/doc matching
 ├── MathDetector            flags maths questions for terse answers
 ├── MemoryExtractor         parses & strips the @MEMORY tag
 ├── FactMiner               local fallback fact extraction
 ├── ResponseFormatter       enforces WhatsApp formatting; chunks long replies
-├── IdentityGuard           keeps Alexa in character (no vendor leaks)
+├── IdentityGuard           keeps Alexa in character (no vendor leaks, no
+│                           "Alexa Mini", no self-denial)
+├── AmnesiaGuard            never let her deny a memory she actually has
 ├── ImageDescriber          vision chain: DeepAI -> OCR -> honest fallback
 └── JidParser               normalises @lid / @s.whatsapp.net / @g.us
 ```
 
-### Three engineering decisions worth knowing
+### Five engineering decisions worth knowing
 
 **1. Triggers are matched in code, not by the model.**
 The spec requires byte-exact outputs (`weather Colombo`, `menu`, `ping`, `doc`)
@@ -241,6 +328,19 @@ high-confidence facts from the user's own words using explicit first-person
 patterns (and skips third-party statements like *"my friend lives in Kandy"*).
 Model-emitted tags always win on conflict. Disable with `factMining: false`.
 
+**4. Identity is a graph, not a column.**
+A person is not their jid. `wa_user_identities` maps every address to one human,
+and two rows that turn out to be the same person are merged inside a
+transaction — memories, transcripts, group membership and counters included.
+This is what makes DM facts appear in groups.
+
+**5. The last word belongs to the engine, not the model.**
+Two deterministic post-processors run on every reply: `IdentityGuard`
+(vendor names, `Alexa Mini`-style renames, self-denials) and `AmnesiaGuard`
+("I can't remember you" while the database holds four facts about you). Both
+rewrite from data we already have, so they add zero latency and cannot be
+argued with by the model.
+
 ---
 
 ## Configuration
@@ -251,8 +351,27 @@ new AlexaAI({
     postgresUrl: 'postgres://...', // required (aliases: postgueurl, databaseUrl)
 
     model: 'standard',             // DeepAI model
+    fallbackModels: ['standard'],  // tried when the main model is refused
     visionModel: 'gpt-4o-mini',    // used when an image is attached
-    systemPrompt: '...',           // override the Alexa persona
+    visionModels: [...],           // full vision fallback chain
+    keys: ['tryit-a', 'tryit-b'],  // rotated on "try it exceeded"
+    autoKeyRotation: false,        // mint a fresh anonymous key when all are spent
+
+    assistantName: 'Alexa',        // persona name (also drives the guards)
+    creator: 'Hansaka',            // persona creator
+    systemPrompt: '...',           // override the whole Alexa persona
+    systemRole: true,              // also send a role:'system' digest
+    identityLock: true,            // inject the identity lock on identity questions
+    amnesiaGuard: true,            // repair "I can't remember" denials
+
+    linkIdentities: true,          // @lid <-> phone alias graph
+    mergeIdentities: true,         // merge rows that prove to be one person
+
+    webAccess: false,              // DeepAI web search on every turn
+    thinkingSupport: false,        // async reasoning path
+    serverMemory: false,           // DeepAI's own /chat_memory profile
+    enabledTools: ['image_generator', 'image_editor'],
+    endpoints: { chat: '/hacking_is_a_serious_crime', ... },  // override any route
 
     historyLimit: 14,              // past messages replayed to the model
     maxMemories: 25,               // facts injected per request
@@ -305,24 +424,94 @@ so your bot can simply skip sending.
 
 ---
 
-## Verified DeepAI API behaviour
+## The whole DeepAI API, not just the chat endpoint
 
-Reverse-engineered from the DeepAI chat page and confirmed against the live
-endpoint:
+Every route below was read out of the live deepai.org client and is implemented
+in `DeepAIClient`. They are reachable from your bot as `ai.deepai.*`, and the
+paths live in one overridable map (`Config.endpoints`), so a DeepAI rename is a
+config change, not a code change.
+
+| area | route | client method |
+| ---- | ----- | ------------- |
+| chat | `POST /hacking_is_a_serious_crime` | `chat()` / `chatDetailed()` |
+| reasoning tasks | `GET /check_chat_task_status?type=&task_id=` | `taskStatus()` / `waitForTask()` |
+| moderation score | `GET /check-sensitivity?request_id=` | `checkSensitivity()` |
+| attachments | `POST /chat_attachments/upload` | `uploadAttachment()` |
+| attachments | `GET /chat_attachments/get?uuid=` | `getAttachment()` |
+| sessions | `POST /save_chat_session` | `saveSession()` |
+| sessions | `GET /get_chat_session?uuid=` | `getSession()` |
+| sessions | `POST /rename_chat_session` | `renameSession()` |
+| sessions | `POST /delete_chat_session` | `deleteSession()` |
+| sessions | `POST /delete_all_chat_history` | `deleteAllSessions()` |
+| account memory | `GET/POST /chat_memory` | `chatMemory()` |
+| agent mode | `GET/POST /chat_sandbox` | `chatSandbox()` |
+| background tasks | `GET/POST /chat_concierge` | `chatConcierge()` |
+| abuse report | `POST /report_character` | `reportCharacter()` |
+| image generation | `POST /api/text2img` | `text2img()` |
+| image editing | `POST /api/image-editor` | `editImage()` |
+| upscaling | `POST /api/torch-srgan` | `upscaleImage()` |
+| colourising | `POST /api/colorizer` | `colorizeImage()` |
+| moderation | `POST /api/nsfw-detector` | `detectNsfw()` |
+| summarising | `POST /api/summarization` | `summarize()` |
+| anything else | `POST /api/<name>` | `runApi(name, fields)` |
+
+Convenience wrappers on the engine itself:
+
+```js
+await ai.generateImage('a red tuk-tuk in Galle at sunset'); // { ok, url, id }
+await ai.upscaleImage(buffer);
+await ai.editImage(buffer, 'make the sky purple');
+await ai.detectNsfw(buffer);           // moderation before you forward media
+await ai.searchWeb('LKR to USD today') // chat + web access, no memory writes
+await ai.summarizeText(longText);
+await ai.describeImage({ buffer });    // vision chain on demand
+await ai.deepaiHealth();               // is the key still good?
+await ai.deepai.runApi('waifu2x', { image: buffer });  // escape hatch
+```
+
+### The chat request, field by field
 
 ```http
 POST https://api.deepai.org/hacking_is_a_serious_crime
 api-key: tryit-...
+Origin: https://deepai.org
 Content-Type: multipart/form-data
 
-chat_style       = chat
-chatHistory      = [{"role":"user","content":"..."}]
-model            = standard
-hacker_is_stinky = very_stinky
+chat_style                 = chat
+chatHistory                = [{"role":"user","content":"..."}]
+model                      = standard
+session_uuid               = <uuid v4>
+tool_activity_support      = 1
+thinking_image_tool_support= 1
+enabled_tools              = ["image_generator","image_editor"]
+attachment_uuids           = ["..."]     (top level — never inside a message)
+memory_enabled             = true|false
+web_access_enabled         = true|false
+sandbox_enabled            = true|false   (+ sandbox_turn_id)
+concierge_enabled          = true|false
+thinking_support           = 1            (-> {"task_id"} + polling)
+hacker_is_stinky           = very_stinky
 ```
 
-- The response is **plain streamed text**, not JSON and not SSE.
-- Errors arrive as a short JSON body: `{"status": "Only paid accounts can use genius"}`.
+### The response is not plain prose
+
+The body is a stream of UTF-8 text with out-of-band packets embedded in it.
+`StreamParser` splits them apart so none of this can ever reach WhatsApp:
+
+```
+\u001C{"tool_activity":"Searching the web"}\u001C   tool status pings
+…answer…\u001C[{"title":…,"url":…}]                 web-search sources
+…answer…\u001C{"type":"generated_image","share_url":…} generated image
+\u001DTHINKING_START12s\u001E<chain of thought>\u001DTHINKING_END
+```
+
+Before this fix the raw stream was forwarded verbatim — control characters,
+JSON blobs and the model's private reasoning included.
+
+- The response is **streamed text**, not JSON and not SSE.
+- Errors arrive as a short JSON body: `{"status": "Only paid accounts can use genius"}`
+  — even with HTTP 200. Quota refusals rotate to the next configured key
+  automatically before the model chain is tried.
 - **`role: "system"` is silently ignored.** A system message had zero effect on
   output; the persona is therefore delivered as a priming user/assistant pair,
   which the API does honour.
@@ -344,6 +533,19 @@ Attachments run through a **provider chain** — first success wins:
 | 1 | **DeepAI native vision** | full understanding of any photo | ❌ paid only |
 | 2 | **OCR** (`ocr.space`) | text inside images/screenshots | ✅ yes |
 | 3 | Honest fallback | photos with no text | ✅ yes |
+
+Improvements in this release:
+
+- the file is uploaded **once** and reused by every provider;
+- the whole `visionModels` chain is tried (`gpt-4o-mini` → `gpt-4.1-mini` →
+  `gpt-4o` → `standard`), per-model, instead of one model and a permanent latch;
+- a plan refusal puts vision on a **30-minute cooldown** rather than disabling it
+  for the lifetime of the process, so upgrading a key just starts working;
+- when the upload succeeded but we could not pre-read the image, the
+  `attachment_uuids` are forwarded to the **real conversation**, so an account
+  with vision sees the photo with full context instead of a side request;
+- inputs may be a `Buffer`, `Uint8Array`, data URI, raw base64, or URL, and
+  oversized files are rejected instead of being truncated (`maxImageBytes`).
 
 The engine follows the browser's exact sequence — `upload` → `get` → `chat` —
 and reads `extraction_status` from the `get` response to decide what to do:
@@ -441,14 +643,53 @@ before the fix:
 "are you ChatGPT?"    -> "I am Standard AI Chat by DeepAI, not ChatGPT."
 ```
 
-Few-shot examples did **not** help (5/6 still leaked). `IdentityGuard` fixes it
-with two layers:
+And the subtler failure the bot owner reported — the backend does not ignore the
+persona so much as **rename** it, pinning its own model tier on the end and then
+denying the real name:
 
-1. **Pre-flight** — an identity question gets a short *IDENTITY LOCK* hint
-   injected right above it.
-2. **Post-flight** — every reply is scrubbed of `DeepAI`, `ChatGPT`, `OpenAI`,
-   `GPT-*`, `Llama`, `Claude`, `Gemini`, "large language model", etc., so a
-   vendor name can never reach the user even if volunteered unprompted.
+```
+"are you alexa?"      -> "I'm Alexa Mini, not Alexa."
+```
+
+Few-shot examples did **not** help (5/6 still leaked). `IdentityGuard` fixes it
+with three layers:
+
+1. **Persona** — `[IDENTITY RULES]` in the system prompt spell out that the name
+   is exact and that variants and denials are forbidden.
+2. **Pre-flight** — an identity question gets a short *IDENTITY LOCK* hint
+   injected right above it, naming the forbidden variants explicitly.
+3. **Post-flight** — every reply is scrubbed of `DeepAI`, `ChatGPT`, `OpenAI`,
+   `GPT-*`, `Llama`, `Claude`, `Gemini`, "large language model", **model-tier
+   suffixes** (`Alexa Mini`, `Alexa Nano`, `Alexa 4.1`) and **self-denials**
+   (`…, not Alexa`), so nothing wrong can reach the user even if volunteered.
+
+```js
+IdentityGuard.sanitise('I am Alexa Mini, not Alexa.')        // -> 'I am Alexa.'
+IdentityGuard.sanitise('I am not Alexa, I am GPT-4.1 Nano.') // -> 'I am Alexa.'
+```
+
+Renaming the assistant renames the guard with it:
+
+```js
+new AlexaAI({ key, postgresUrl, assistantName: 'Nova', creator: 'Kasun' });
+```
+
+### Memory lock (`AmnesiaGuard`)
+
+The same treatment for the other false statement:
+
+```
+[GROUP] "do you remember me?"
+  before -> "Unfortunately, as a bot I can't remember you."
+  after  -> "Of course I remember you, *Nimal*! 😊 I remember that you're
+             from _Galle_ and you love _cricket_."
+```
+
+A recall question gets a `[MEMORY CHECK]` directive carrying the stored facts,
+and any denial that still slips through is rewritten from the database. When
+there genuinely is nothing stored the reply is honest — *"I don't have any
+details saved about you yet"* — but she never claims to be incapable of
+remembering.
 
 Result — **0/7 leaks**:
 
@@ -475,10 +716,20 @@ POSTGRES_URL=postgres://postgres:pass@localhost:5432/alexa node test/run-tests.j
 POSTGRES_URL=... DEEPAI_KEY=tryit-... node test/run-tests.js
 ```
 
-**165 assertions, all passing** against a real PostgreSQL 17 instance and the
-live DeepAI API — covering jid parsing, memory extraction from malformed model
-output, trigger matching, formatting enforcement, cross-group memory recall,
-per-user isolation, message dedupe, and history windowing.
+**217 assertions, all passing** with no network and no database, plus a live
+integration suite. They cover jid parsing, alias collection, memory
+extraction from malformed model output, trigger matching, formatting
+enforcement, identity/amnesia repair, the DeepAI stream packet format, and the
+full request shape of every endpoint (via a mocked transport, so a regression in
+the wire format fails the build instead of the bot). One suite drives the entire
+`chat()` pipeline against a fake database and a fake DeepAI, reproducing the
+reported bug ("I can't remember you" in a group, "I'm Alexa Mini") and proving
+it fixed.
+
+With `POSTGRES_URL` set, the integration suite additionally proves the headline
+fix end to end: a fact learned under a phone jid in a DM is readable under the
+`@lid` in a group, two pre-existing rows merge without losing a memory or a
+transcript, and unrelated users stay isolated.
 
 An interactive walkthrough of the whole scenario:
 

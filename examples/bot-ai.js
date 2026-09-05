@@ -145,10 +145,43 @@ function guessMime(p) {
 }
 
 /**
+ * Turn whatever the bot knows about the sender into the address list the
+ * engine needs.
+ *
+ * WHY THIS MATTERS
+ * ----------------
+ * WhatsApp calls the same human `947…@s.whatsapp.net` in a DM and
+ * `781…@lid` in a group. If you only ever pass one of them, the engine sees
+ * two different people and Alexa "forgets" the user in groups.
+ *
+ * Baileys hands you both on every group message:
+ *
+ *   const sender    = msg.key.participant || msg.key.remoteJid;   // often @lid
+ *   const senderAlt = msg.key.participantAlt || msg.key.participantPn; // phone jid
+ *
+ * Pass BOTH (as an object or an array) and the engine links them for good.
+ */
+function toIdentity(userId) {
+  if (Array.isArray(userId)) {
+    return { userId: String(userId[0] || ""), aliases: userId.slice(1).map(String) };
+  }
+  if (userId && typeof userId === "object") {
+    return {
+      userId: String(userId.id || userId.jid || userId.lid || ""),
+      userLid: userId.lid ? String(userId.lid) : undefined,
+      userPhone: userId.phone ? String(userId.phone) : undefined,
+      aliases: (userId.aliases || []).map(String),
+    };
+  }
+  return { userId: String(userId || "default_user") };
+}
+
+/**
  * Main AI function — same signature as the old Gradio implementation.
  *
  * @param {string|{text:string, files:Array}} message
- * @param {string} userId    e.g. '78151912841263@lid'
+ * @param {string|string[]|{id:string,lid?:string,phone?:string}} userId
+ *        '78151912841263@lid', or every address you know for the sender
  * @param {string} [groupId] e.g. '120363413125431525@g.us' ("" for DM)
  * @param {string} [userName]
  * @param {function} [callback] (err, reply)
@@ -181,8 +214,8 @@ async function ai(message, userId, groupId = "", userName = "User", callback) {
 
     // --- ask Alexa ----------------------------------------------------------
     const result = await client.chat({
+      ...toIdentity(userId),
       message: text,
-      userId: String(userId || "default_user"),
       groupId: groupId ? String(groupId) : null,
       userName: String(userName || "User"),
       image,
@@ -227,8 +260,35 @@ ai.getProfile = async (userId) => getEngine().getProfile(userId);
 /** Engine stats for the dashboard. */
 ai.stats = async () => getEngine().stats();
 
-/** Health probe. */
+/** Health probe (database). */
 ai.health = async () => getEngine().health();
+
+/** Health probe (DeepAI itself: reachability + key validity). */
+ai.deepaiHealth = async () => getEngine().deepaiHealth();
+
+/**
+ * `.link` command / automatic LID mapping — tell Alexa two addresses are the
+ * same human. Call it whenever Baileys reveals a mapping, e.g.
+ *
+ *   const pn = await sock.signalRepository.lidMapping.getPNForLID(lid);
+ *   if (pn) await ai.linkIdentity(lid, pn);
+ */
+ai.linkIdentity = async (jidA, jidB) => getEngine().linkIdentity(jidA, jidB);
+
+/** Every WhatsApp address Alexa knows for this person. */
+ai.getAliases = async (userId) => getEngine().getAliases(userId);
+
+/** `.image <prompt>` command — DeepAI text-to-image. */
+ai.generateImage = async (prompt, opts) => getEngine().generateImage(prompt, opts);
+
+/** `.upscale` / `.hd` command — 4x super-resolution. */
+ai.upscaleImage = async (image) => getEngine().upscaleImage(image);
+
+/** `.search <query>` command — DeepAI chat with web access. */
+ai.searchWeb = async (query) => getEngine().searchWeb(query);
+
+/** Read an image or document without adding it to the conversation. */
+ai.describeImage = async (image, caption) => getEngine().describeImage(image, caption);
 
 /** Close the PostgreSQL pool on shutdown. */
 ai.close = async () => {

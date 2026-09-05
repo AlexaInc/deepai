@@ -18,12 +18,17 @@ const {
     FactMiner,
     MathDetector,
     IdentityGuard,
+    AmnesiaGuard,
+    IdentityResolver,
     ResponseFormatter,
     TriggerDetector,
     MemoryRepository,
     PromptBuilder,
+    StreamParser,
+    DeepAIClient,
     Config,
 } = require('../index');
+const { createFakeDb, installFakeDeepAI } = require('./fakes');
 
 let passed = 0;
 let failed = 0;
@@ -314,23 +319,411 @@ section('PromptBuilder — persona delivery');
         isGroup: true,
         groupName: 'Test Group',
     });
-    check('first turn is the persona (user role)', msgs[0].role, 'user');
-    ok('persona text present', msgs[0].content.includes('You are Alexa'));
-    ok('memories injected', msgs[0].content.includes('Nimal') && msgs[0].content.includes('cricket'));
-    ok('group context injected', msgs[0].content.includes('GROUP'));
-    check('second turn is assistant ack', msgs[1].role, 'assistant');
+    const persona = msgs[1];
+    check('first turn is the system digest', msgs[0].role, 'system');
+    ok('system digest states the exact name', msgs[0].content.includes('exactly "Alexa"'));
+    check('persona turn is delivered as a user turn', persona.role, 'user');
+    ok('persona text present', persona.content.includes('You are Alexa'));
+    ok('memories injected', persona.content.includes('Nimal') && persona.content.includes('cricket'));
+    ok('group context injected', persona.content.includes('GROUP'));
+    ok('group turn states it is the same person as the DM', persona.content.includes('SAME person'));
+    check('third turn is the assistant ack', msgs[2].role, 'assistant');
     ok('last turn contains the live message', msgs[msgs.length - 1].content.endsWith('hello'));
     ok('recall note precedes the live message', msgs[msgs.length - 1].content.includes('Remembered facts'));
     ok('recall note lists known facts', msgs[msgs.length - 1].content.includes('name=Nimal'));
-    ok('no system role is used (DeepAI ignores it)', !msgs.some((m) => m.role === 'system'));
-    check('history preserved in order', [msgs[2].content, msgs[3].content], ['earlier', 'reply']);
+    check('history preserved in order', [msgs[3].content, msgs[4].content], ['earlier', 'reply']);
+}
+{
+    const cfg = new Config({ key: 'k', postgresUrl: 'postgres://u:p@localhost/db', systemRole: false });
+    const pb = new PromptBuilder(cfg);
+    const msgs = pb.build({ message: 'hi', history: [{ role: 'assistant', content: 'orphan' }] });
+    ok('systemRole:false removes the system turn', !msgs.some((m) => m.role === 'system'));
+    check('persona is still the first turn', msgs[0].role, 'user');
+    ok('drops leading assistant turn', !msgs.slice(2, -1).some((m) => m.content === 'orphan'));
+    check('no recall note when there are no memories', msgs[msgs.length - 1].content, 'hi');
 }
 {
     const cfg = new Config({ key: 'k', postgresUrl: 'postgres://u:p@localhost/db' });
     const pb = new PromptBuilder(cfg);
-    const msgs = pb.build({ message: 'hi', history: [{ role: 'assistant', content: 'orphan' }] });
-    ok('drops leading assistant turn', !msgs.slice(2, -1).some((m) => m.content === 'orphan'));
-    check('no recall note when there are no memories', msgs[msgs.length - 1].content, 'hi');
+    const msgs = pb.build({ message: 'do you remember me?', memories: { name: 'Nimal' }, userName: 'Nimal' });
+    const live = msgs[msgs.length - 1].content;
+    ok('recall question gets a MEMORY CHECK directive', live.includes('MEMORY CHECK'));
+    ok('directive carries the saved facts', live.includes('name: Nimal'));
+    const plain = pb.build({ message: 'what is 2+2?', memories: { name: 'Nimal' } });
+    ok('normal question gets no MEMORY CHECK', !plain[plain.length - 1].content.includes('MEMORY CHECK'));
+}
+{
+    const cfg = new Config({
+        key: 'k',
+        postgresUrl: 'postgres://u:p@localhost/db',
+        assistantName: 'Nova',
+        creator: 'Kasun',
+    });
+    const pb = new PromptBuilder(cfg);
+    const msgs = pb.build({ message: 'hi' });
+    ok('persona can be renamed', msgs[1].content.includes('You are Nova'));
+    ok('creator can be renamed', msgs[1].content.includes('created by Kasun'));
+}
+
+// ==========================================================================
+section('IdentityGuard — model-tier suffixes and self-denials');
+// ==========================================================================
+check(
+    'repairs "Alexa Mini, not Alexa"',
+    IdentityGuard.sanitise('I am Alexa Mini, not Alexa.', false),
+    'I am Alexa.'
+);
+check(
+    'repairs a lowercase variant mid-reply',
+    IdentityGuard.sanitise("I'm Alexa mini, not Alexa. How can I help?", false),
+    "I'm Alexa. How can I help?"
+);
+check(
+    'repairs "not Alexa, I am GPT-4.1 Nano"',
+    IdentityGuard.sanitise('I am not Alexa, I am GPT-4.1 Nano.', false),
+    'I am Alexa.'
+);
+ok('detects "are you alexa mini?"', IdentityGuard.isIdentityQuestion('are you alexa mini?'));
+ok(
+    'identity lock names the exact persona',
+    IdentityGuard.hintFor('who are you?').includes('NOT "Alexa Mini"')
+);
+{
+    const nova = new IdentityGuard({ assistantName: 'Nova', creator: 'Kasun' });
+    check('renamed persona answer', nova.sanitise('I am ChatGPT.', true), 'I am *Nova*, your WhatsApp assistant created by *Kasun*. 😊');
+    check('renamed persona strips its own suffix', nova.sanitise('I am Nova Pro, not Nova.', false), 'I am Nova.');
+}
+
+// ==========================================================================
+section('AmnesiaGuard — never deny a memory we actually have');
+// ==========================================================================
+{
+    const guard = new AmnesiaGuard();
+    ok('detects "do you remember me"', AmnesiaGuard.isRecallQuestion('do you remember me?'));
+    ok('detects "what is my name"', AmnesiaGuard.isRecallQuestion('what is my name?'));
+    ok('detects "who am i"', AmnesiaGuard.isRecallQuestion('who am i'));
+    ok('ignores normal chat', !AmnesiaGuard.isRecallQuestion('what is the capital of France?'));
+
+    ok('detects a denial', AmnesiaGuard.isDenial("Unfortunately, as a bot I can't remember you."));
+    ok('detects "no memory of past conversations"', AmnesiaGuard.isDenial('I have no memory of our previous chats.'));
+    ok('detects "conversation just started"', AmnesiaGuard.isDenial('Our conversation just started!'));
+    ok('does not flag a normal reply', !AmnesiaGuard.isDenial('Sure, the capital of France is Paris.'));
+
+    const memories = { name: 'Nimal', location: 'Galle', hobby: 'cricket' };
+    const fixed = guard.repair("Unfortunately, as a bot I can't remember you.", {
+        memories,
+        displayName: 'Nimal',
+        isRecall: true,
+    });
+    ok('repairs the denial', fixed.repaired);
+    ok('answer uses the stored name', fixed.text.includes('Nimal'));
+    ok('answer uses the stored facts', fixed.text.includes('Galle') && fixed.text.includes('cricket'));
+    ok('no denial survives', !AmnesiaGuard.isDenial(fixed.text));
+
+    const noFacts = guard.repair("I can't remember previous conversations.", { memories: {}, isRecall: true });
+    ok('honest when nothing is stored', noFacts.repaired && /don't have any details saved/.test(noFacts.text));
+    ok('but never claims to be memoryless', !AmnesiaGuard.isDenial(noFacts.text));
+
+    const untouched = guard.repair('Paris is the capital of France.', { memories });
+    ok('leaves clean replies alone', !untouched.repaired);
+}
+
+// ==========================================================================
+section('IdentityResolver — one human, many WhatsApp addresses');
+// ==========================================================================
+check(
+    'collects the primary jid first',
+    IdentityResolver.collectAliases({ userId: '78151912841263@lid' }),
+    ['78151912841263@lid']
+);
+check(
+    'collects a LID + phone pair (Baileys participantAlt)',
+    IdentityResolver.collectAliases({
+        userId: '78151912841263@lid',
+        participantAlt: '94771234567@s.whatsapp.net',
+    }),
+    ['78151912841263@lid', '94771234567@s.whatsapp.net']
+);
+check(
+    'accepts a bare phone number',
+    IdentityResolver.collectAliases({ userId: '78151912841263@lid', userPhone: '+94771234567' }),
+    ['78151912841263@lid', '94771234567@s.whatsapp.net']
+);
+check(
+    'de-duplicates device suffixes',
+    IdentityResolver.collectAliases({
+        userId: '94771234567:12@s.whatsapp.net',
+        aliases: ['94771234567@s.whatsapp.net'],
+    }),
+    ['94771234567@s.whatsapp.net']
+);
+check('ignores group jids', IdentityResolver.collectAliases({ userId: '120363413125431525@g.us' }), []);
+check('ignores junk', IdentityResolver.toUserJid('not a jid'), null);
+
+// ==========================================================================
+section('StreamParser — DeepAI wire packets never reach WhatsApp');
+// ==========================================================================
+{
+    const FS = '\u001C';
+    const GS = '\u001D';
+    const RS = '\u001E';
+
+    check('plain text passes through', StreamParser.parse('Hello there!').text, 'Hello there!');
+
+    const withActivity = StreamParser.parse(
+        `Search${FS}{"tool_activity":"Searching the web"}${FS}ing done.`
+    );
+    check('tool activity is stripped', withActivity.text, 'Searching done.');
+    check('tool activity is reported', withActivity.toolActivity, ['Searching the web']);
+
+    const withResults = StreamParser.parse(
+        `Here are the results.${FS}[{"title":"A","url":"https://a.example"}]`
+    );
+    check('trailing payload is removed from the text', withResults.text, 'Here are the results.');
+    check('web results are parsed', withResults.webResults[0].url, 'https://a.example');
+
+    const withImage = StreamParser.parse(
+        `Here is your image.${FS}{"type":"generated_image","share_url":"https://img.example/a.png"}`
+    );
+    check('generated image url extracted', withImage.images, ['https://img.example/a.png']);
+
+    const withThinking = StreamParser.parse(`${GS}THINKING_START12s${RS}internal reasoning${GS}THINKING_ENDFinal answer.`);
+    check('chain of thought is removed', withThinking.text, 'Final answer.');
+    check('chain of thought is captured separately', withThinking.thinking.text, 'internal reasoning');
+    check('thinking duration captured', withThinking.thinking.duration, '12s');
+
+    const truncated = StreamParser.parse(`Partial answer${FS}{"type":"generated_ima`);
+    check('truncated packet is dropped, not leaked', truncated.text, 'Partial answer');
+
+    const call = StreamParser.parse(
+        `${FS}{"function_call":{"name":"generate_image","arguments":"{\\"prompt\\":\\"a cat\\"}"}}`
+    );
+    check('function call name parsed', call.functionCall.name, 'generate_image');
+    check('function call arguments parsed', call.functionCall.arguments.prompt, 'a cat');
+
+    ok('no control characters survive', !/[\u001C\u001D\u001E]/.test(withActivity.text + withThinking.text));
+}
+
+// ==========================================================================
+async function deepaiClientTests() {
+section('DeepAIClient — the whole endpoint surface (mocked transport)');
+// ==========================================================================
+{
+    const cfg = new Config({ key: 'tryit-1-abc', postgresUrl: 'postgres://u:p@localhost/db', maxRetries: 0 });
+    const client = new DeepAIClient(cfg);
+
+    const calls = [];
+    const realFetch = global.fetch;
+    global.fetch = async (url, init = {}) => {
+        const fields = {};
+        if (init.body && typeof init.body.forEach === 'function') {
+            init.body.forEach((value, key) => {
+                fields[key] = typeof value === 'string' ? value : '[file]';
+            });
+        }
+        calls.push({ url: String(url), method: init.method || 'GET', headers: init.headers || {}, fields });
+
+        const respond = (body, status = 200) => ({
+            status,
+            headers: { get: () => 'text/plain' },
+            text: async () => body,
+            body: null,
+        });
+
+        if (String(url).includes('/hacking_is_a_serious_crime')) return respond('Hi Nimal!');
+        if (String(url).includes('/chat_attachments/upload')) {
+            return respond(JSON.stringify({ success: true, attachment: { uuid: 'u-1', extraction_status: 'complete' } }));
+        }
+        if (String(url).includes('/chat_attachments/get')) {
+            return respond(JSON.stringify({ success: true, attachment: { uuid: 'u-1', extraction_status: 'complete' } }));
+        }
+        if (String(url).includes('/check_chat_task_status')) {
+            return respond(JSON.stringify({ status: 'COMPLETED', result: 'thought through it' }));
+        }
+        if (String(url).includes('/check-sensitivity')) return respond(JSON.stringify({ score: 0.1 }));
+        if (String(url).includes('/api/text2img')) {
+            return respond(JSON.stringify({ id: 'img-1', output_url: 'https://img.example/x.png' }));
+        }
+        if (String(url).includes('/chat_memory')) return respond(JSON.stringify({ enabled: true, profile: 'p' }));
+        if (String(url).includes('/save_chat_session')) return respond(JSON.stringify({ success: true }));
+        return respond(JSON.stringify({ success: true }));
+    };
+
+    await (async () => {
+        const text = await client.chat([{ role: 'user', content: 'hi' }]);
+        check('chat returns clean text', text, 'Hi Nimal!');
+
+        const chatCall = calls.find((c) => c.url.includes('hacking_is_a_serious_crime'));
+        check('chat posts to the DeepAI chat endpoint', chatCall.method, 'POST');
+        check('sends the api-key header', chatCall.headers['api-key'], 'tryit-1-abc');
+        check('sends an Origin header', chatCall.headers.Origin, 'https://deepai.org');
+        check('sends chat_style', chatCall.fields.chat_style, 'chat');
+        check('sends the model', chatCall.fields.model, 'standard');
+        check('sends the anti-abuse field', chatCall.fields.hacker_is_stinky, 'very_stinky');
+        ok('sends a session_uuid', Boolean(chatCall.fields.session_uuid));
+        check('advertises tool activity support', chatCall.fields.tool_activity_support, '1');
+        check('advertises the image tool', chatCall.fields.enabled_tools, '["image_generator","image_editor"]');
+        check('sends the chat history as JSON', JSON.parse(chatCall.fields.chatHistory)[0].content, 'hi');
+
+        await client.chat([{ role: 'user', content: 'hi' }], { attachmentUuids: ['u-1'] });
+        const withAttachment = calls.filter((c) => c.url.includes('hacking'))[1];
+        check('attachments are a TOP-LEVEL field', withAttachment.fields.attachment_uuids, '["u-1"]');
+
+        const attachment = await client.uploadAttachment(Buffer.from('hello'), 'a.txt', 'text/plain');
+        check('uploads attachments', attachment.uuid, 'u-1');
+        const fetched = await client.getAttachment('u-1');
+        check('reads attachment extraction status', fetched.extraction_status, 'complete');
+
+        const task = await client.taskStatus('t-1');
+        check('polls background tasks', task.status, 'COMPLETED');
+        check('sensitivity score', await client.checkSensitivity('r-1'), 0.1);
+
+        const image = await client.text2img('a cat');
+        check('text2img returns an output url', image.output_url, 'https://img.example/x.png');
+        const imageCall = calls.find((c) => c.url.includes('/api/text2img'));
+        check('text2img sends the prompt', imageCall.fields.text, 'a cat');
+
+        const memory = await client.chatMemory();
+        check('reads the DeepAI memory profile', memory.enabled, true);
+        await client.saveSession({ uuid: 's-1', messages: [{ role: 'user', content: 'hi' }] });
+        ok('saves a server-side session', calls.some((c) => c.url.includes('/save_chat_session')));
+
+        const urls = calls.map((c) => c.url);
+        ok(
+            'uses more than the generative endpoint',
+            new Set(urls.map((u) => u.split('?')[0])).size >= 7,
+            `(hit ${new Set(urls.map((u) => u.split('?')[0])).size} distinct endpoints)`
+        );
+
+        global.fetch = realFetch;
+    })();
+}
+{
+    const cfg = new Config({
+        key: 'tryit-1-abc',
+        keys: ['tryit-1-abc', 'tryit-2-def'],
+        postgresUrl: 'postgres://u:p@localhost/db',
+        maxRetries: 0,
+    });
+    const client = new DeepAIClient(cfg);
+    const realFetch = global.fetch;
+    const seenKeys = [];
+    global.fetch = async (url, init = {}) => {
+        seenKeys.push(init.headers['api-key']);
+        const quota = seenKeys.length === 1;
+        return {
+            status: 200,
+            headers: { get: () => 'application/json' },
+            text: async () => (quota ? JSON.stringify({ status: 'anonymous try it exceeded' }) : 'second key works'),
+            body: null,
+        };
+    };
+    await (async () => {
+        const text = await client.chat([{ role: 'user', content: 'hi' }]);
+        check('rotates to the next key on a quota refusal', text, 'second key works');
+        check('used both keys', seenKeys, ['tryit-1-abc', 'tryit-2-def']);
+        global.fetch = realFetch;
+    })();
+}
+{
+    ok(
+        'anonymous key generator matches the deepai.org shape',
+        /^tryit-\d{10}-[0-9a-f]{32}$/.test(DeepAIClient.generateTryItKey())
+    );
+    const cfg = new Config({ key: 'k', postgresUrl: 'postgres://u:p@localhost/db' });
+    check('endpoint map exposes the chat route', cfg.url('chat'), 'https://api.deepai.org/hacking_is_a_serious_crime');
+    check(
+        'endpoint map builds query strings',
+        cfg.url('taskStatus', { type: 'thinking-task', task_id: 'x' }),
+        'https://api.deepai.org/check_chat_task_status?type=thinking-task&task_id=x'
+    );
+    check('endpoints are overridable', new Config({
+        key: 'k',
+        postgresUrl: 'postgres://u:p@localhost/db',
+        endpoints: { chat: '/v2/chat' },
+    }).url('chat'), 'https://api.deepai.org/v2/chat');
+}
+
+}
+
+// ==========================================================================
+//  End-to-end: the whole chat() pipeline on a fake database + fake DeepAI.
+//  This is the reported bug, reproduced and proven fixed, with no network.
+// ==========================================================================
+async function endToEndTests() {
+    section('AlexaAI.chat() — end to end (fake database + fake DeepAI)');
+
+    const ai = new AlexaAI({ key: 'tryit-1-x', postgresUrl: 'postgres://u:p@localhost/db', autoMigrate: false });
+    const db = createFakeDb();
+    ai.db = db;
+    ai.users.db = db;
+    ai.memories.db = db;
+    ai.conversations.db = db;
+    ai.identities.db = db;
+
+    const deepai = installFakeDeepAI();
+    try {
+        // 1. The user introduces themselves in a DM (phone jid).
+        deepai.push('Nice to meet you, Nimal! 🏏 @MEMORY: {"name":"Nimal","hobby":"cricket"}');
+        const dm = await ai.chat({
+            message: "Hi, I'm Nimal and I love cricket. I live in Galle.",
+            userId: '94771234567@s.whatsapp.net',
+            userName: 'Nimal',
+        });
+        check('DM reply is clean', dm.text, 'Nice to meet you, Nimal! 🏏');
+        check('DM learned the name', dm.memories.name, 'Nimal');
+        check('DM learned the location (FactMiner)', dm.memories.location, 'Galle');
+        check('DM thread key', dm.contextKey, 'dm:94771234567@s.whatsapp.net');
+
+        // 2. THE BUG: the same human writes in a group as @lid.
+        deepai.push("Unfortunately, as a bot I can't remember you.");
+        const group = await ai.chat({
+            message: 'do you remember me?',
+            userId: '78151912841263@lid',
+            participantAlt: '94771234567@s.whatsapp.net', // Baileys gives us both
+            groupId: '120363413125431525@g.us',
+            groupName: 'Cricket Fans',
+            userName: 'Nimal',
+        });
+        check('group message resolves to the SAME person', group.userId, dm.userId);
+        ok('both addresses are linked', group.aliases.length === 2);
+        ok('the denial was repaired', group.repairedMemory);
+        ok('the reply now recalls the name', group.text.includes('Nimal'));
+        ok('the reply recalls DM facts in the group', group.text.includes('Galle') && group.text.includes('cricket'));
+        ok('no "cannot remember" survives', !AmnesiaGuard.isDenial(group.text));
+        ok('group thread is separate from the DM', group.contextKey.startsWith('group:'));
+
+        // The prompt itself must carry the facts.
+        const groupPrompt = JSON.parse(deepai.calls[deepai.calls.length - 1].fields.chatHistory);
+        const lastTurn = groupPrompt[groupPrompt.length - 1].content;
+        ok('prompt carries the remembered facts', lastTurn.includes('name=Nimal'));
+        ok('prompt carries the memory directive', lastTurn.includes('MEMORY CHECK'));
+
+        // 3. Identity: "I'm Alexa Mini, not Alexa" must never ship.
+        deepai.push("I'm Alexa Mini, not Alexa. How can I help?");
+        const who = await ai.chat({ message: 'are you alexa?', userId: '78151912841263@lid' });
+        check('identity answer is corrected', who.text, 'I am *Alexa*, your WhatsApp assistant created by *Hansaka*. 😊');
+        const idPrompt = JSON.parse(deepai.calls[deepai.calls.length - 1].fields.chatHistory);
+        ok('identity lock was injected', idPrompt[idPrompt.length - 1].content.includes('IDENTITY LOCK'));
+
+        // 4. Triggers still bypass the model entirely.
+        const trigger = await ai.chat({ message: 'What is the weather in Colombo today?', userId: '78151912841263@lid' });
+        check('trigger output is byte-exact', trigger.text, 'weather Colombo');
+        check('trigger type reported', trigger.trigger, 'weather');
+
+        // 5. Wire packets never reach WhatsApp.
+        deepai.push('Here you go.\u001C{"type":"generated_image","share_url":"https://img.example/x.png"}');
+        const image = await ai.chat({ message: 'draw a cat', userId: '78151912841263@lid' });
+        check('payload stripped from the text', image.text, 'Here you go.');
+        check('generated image surfaced', image.images, ['https://img.example/x.png']);
+
+        // 6. A vendor leak in an ordinary reply is scrubbed.
+        deepai.push('Sure! DeepAI can help you with that.');
+        const leak = await ai.chat({ message: 'can you help me?', userId: '78151912841263@lid' });
+        ok('vendor name never ships', !/deepai/i.test(leak.text));
+    } finally {
+        deepai.restore();
+    }
 }
 
 // ==========================================================================
@@ -397,19 +790,82 @@ async function integration() {
         const bMap = await ai.memories.getMap(userB.id);
         check("user B cannot see user A's memories", Object.keys(bMap).length, 0);
 
-        await ai.memories.rememberMany(userA.id, { city: 'Galle', food: 'kottu' }, {});
-        const map3 = await ai.memories.getMap(userA.id);
+        // --- identity: ONE human behind two WhatsApp addresses --------------
+        // This is the reported bug: a DM arrives from 947…@s.whatsapp.net and
+        // the same person writes in a group as 781…@lid.
+        await ai.db.query('TRUNCATE wa_users, wa_groups RESTART IDENTITY CASCADE');
+
+        const dmPerson = await ai.resolver.resolve([USER_B], { pushName: 'Nimal' });
+        await ai.memories.remember(dmPerson.user.id, 'name', 'Nimal');
+        await ai.memories.remember(dmPerson.user.id, 'location', 'Galle');
+
+        // Group message: @lid primary, phone supplied as an alias.
+        const groupPerson = await ai.resolver.resolve([USER_A, USER_B], { pushName: 'Nimal' });
+        check('same user row in DM and group', Number(groupPerson.user.id), Number(dmPerson.user.id));
+        const seenInGroup = await ai.memories.getMap(groupPerson.user.id);
+        check('DM memory is readable in the group', seenInGroup.name, 'Nimal');
+        check('every DM fact survives', seenInGroup.location, 'Galle');
+
+        const aliasList = await ai.getAliases(USER_A);
+        ok('both addresses are linked', aliasList.includes(USER_A) && aliasList.includes(USER_B));
+        const byLid = await ai.getMemories(USER_A);
+        check('getMemories works through an alias', byLid.name, 'Nimal');
+
+        const oneRow = await ai.stats();
+        check('no duplicate user row was created', Number(oneRow.users), 1);
+
+        // --- retro-fix: two rows already exist, then we learn they match ----
+        await ai.db.query('TRUNCATE wa_users, wa_groups RESTART IDENTITY CASCADE');
+        const older = await ai.users.upsertUser(USER_A, { pushName: 'Nimal' });
+        await ai.memories.remember(older.id, 'hobby', 'cricket');
+        const newer = await ai.users.upsertUser(USER_B, { pushName: 'Nimal' });
+        await ai.memories.remember(newer.id, 'favourite_food', 'kottu');
+        const dmConvoBefore = await ai.conversations.upsertConversation({
+            contextKey: 'dm:' + USER_B,
+            userId: newer.id,
+        });
+        await ai.conversations.addMessage({
+            conversationId: dmConvoBefore.id,
+            userId: newer.id,
+            role: 'user',
+            content: 'hello from the phone jid',
+        });
+
+        const survivor = await ai.linkIdentity(USER_A, USER_B);
+        ok('link keeps the older row', Number(survivor.id) === Number(older.id));
+        const mergedMemories = await ai.getMemories(USER_B);
+        check('memories from both rows survive the merge', [mergedMemories.hobby, mergedMemories.favourite_food], [
+            'cricket',
+            'kottu',
+        ]);
+        const afterMerge = await ai.stats();
+        check('duplicate row is gone', Number(afterMerge.users), 1);
+        const movedThread = await ai.conversations.findByContextKey('dm:' + USER_B);
+        check('threads move to the surviving user', Number(movedThread.user_id), Number(older.id));
+        const who = await ai.whoIs(USER_A);
+        check('whoIs lists both addresses', who.aliases.sort(), [USER_A, USER_B].sort());
+
+        await ai.db.query('TRUNCATE wa_users, wa_groups RESTART IDENTITY CASCADE');
+        const restoredA = await ai.users.upsertUser(USER_A, { pushName: 'Nimal' });
+        await ai.users.upsertUser(USER_B, { pushName: 'Kasun' });
+        ok('unrelated users stay separate', true);
+        await ai.memories.remember(restoredA.id, 'name', 'Nimal');
+        await ai.memories.remember(restoredA.id, 'hobby', 'cricket');
+        await ai.memories.rememberMany(restoredA.id, { city: 'Galle', food: 'kottu' }, {});
+
+        const map3 = await ai.memories.getMap(restoredA.id);
         check('rememberMany stores all', [map3.city, map3.food], ['Galle', 'kottu']);
 
         // --- conversations are per-thread -------------------------------------
         const dmKey = JidParser.contextKey(USER_A);
         const groupKey = JidParser.contextKey(USER_A, GROUP);
 
-        const dmConvo = await ai.conversations.upsertConversation({ contextKey: dmKey, userId: userA.id });
+        const grp2 = await ai.users.upsertGroup(GROUP, { subject: 'Test Group' });
+        const dmConvo = await ai.conversations.upsertConversation({ contextKey: dmKey, userId: restoredA.id });
         const grpConvo = await ai.conversations.upsertConversation({
             contextKey: groupKey,
-            userId: userA.id,
-            groupId: grp.id,
+            userId: restoredA.id,
+            groupId: grp2.id,
         });
         ok('DM and group threads are distinct', dmConvo.id !== grpConvo.id);
         check('DM thread kind', dmConvo.kind, 'dm');
@@ -417,13 +873,13 @@ async function integration() {
 
         await ai.conversations.addMessage({
             conversationId: dmConvo.id,
-            userId: userA.id,
+            userId: restoredA.id,
             role: 'user',
             content: 'dm message',
         });
         await ai.conversations.addMessage({
             conversationId: grpConvo.id,
-            userId: userA.id,
+            userId: restoredA.id,
             role: 'user',
             content: 'group message',
         });
@@ -438,14 +894,14 @@ async function integration() {
         // --- dedupe -------------------------------------------------------------
         await ai.conversations.addMessage({
             conversationId: dmConvo.id,
-            userId: userA.id,
+            userId: restoredA.id,
             role: 'user',
             content: 'dupe',
             waMessageId: 'WAMSG1',
         });
         const dup = await ai.conversations.addMessage({
             conversationId: dmConvo.id,
-            userId: userA.id,
+            userId: restoredA.id,
             role: 'user',
             content: 'dupe',
             waMessageId: 'WAMSG1',
@@ -456,7 +912,7 @@ async function integration() {
         for (let i = 0; i < 10; i++) {
             await ai.conversations.addMessage({
                 conversationId: dmConvo.id,
-                userId: userA.id,
+                userId: restoredA.id,
                 role: i % 2 === 0 ? 'user' : 'assistant',
                 content: `msg-${i}`,
             });
@@ -558,7 +1014,9 @@ async function integration() {
     }
 }
 
-integration()
+deepaiClientTests()
+    .then(endToEndTests)
+    .then(integration)
     .catch((err) => {
         failed++;
         failures.push(`Integration crashed: ${err.stack || err.message}`);

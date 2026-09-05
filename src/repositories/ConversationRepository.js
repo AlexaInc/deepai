@@ -160,7 +160,11 @@ class ConversationRepository {
         return rowCount;
     }
 
-    /** All threads a user participates in (DM + every group). */
+    /**
+     * All threads a user participates in (DM + every group).
+     * Accepts ANY address the person is known under, not just their canonical
+     * jid, so a group `@lid` finds the threads created from their DM.
+     */
     async listForUser(rawJid) {
         const jid = JidParser.normalize(rawJid);
         return this.db.many(
@@ -169,6 +173,7 @@ class ConversationRepository {
                JOIN wa_users u ON u.id = c.user_id
           LEFT JOIN wa_groups g ON g.id = c.group_id
               WHERE u.jid = $1
+                 OR u.id = (SELECT user_id FROM wa_user_identities WHERE jid = $1)
               ORDER BY c.last_message_at DESC NULLS LAST`,
             [jid]
         );

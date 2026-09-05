@@ -3,24 +3,29 @@
 /**
  * ImageDescriber
  * --------------
- * Turns an attached image into text that PromptBuilder injects into the
- * conversation, so Alexa can answer questions about it.
+ * Turns an attached photo or document into text the model can reason about,
+ * and — when the account really does have vision — hands the attachment
+ * straight to the chat call so the model sees the picture itself.
  *
  * PROVIDER CHAIN (first success wins)
  * -----------------------------------
- *  1. DeepAI attachments  — upload + `attachment_uuids`. This is the "real"
- *     vision path and works on PAID keys. On free `tryit-` keys DeepAI
- *     downgrades every model to `llama-3.1-8b-instruct-turbo` and replies
- *     "does not support image attachments", so we latch it off after the first
- *     refusal instead of burning a request on every image.
- *  2. OCR (ocr.space)     — extracts text from screenshots, documents, error
- *     messages, bills, notes. Verified live: an image containing
- *     "SECRET CODE: ZQ7412" came back correctly. This covers the majority of
- *     images people actually send a WhatsApp bot.
- *  3. Honest fallback     — ask the user to describe it, rather than inventing
- *     a description (the model will happily hallucinate one otherwise).
+ *  0. Documents           — upload + server-side extraction. Works on FREE
+ *                           keys: a .txt/.pdf comes back `complete` and its
+ *                           text IS injected into the model context.
+ *  1. DeepAI vision       — upload once, then try every model in
+ *                           `config.visionModels` (gpt-4o-mini, gpt-4.1-mini,
+ *                           gpt-4o, standard …). Anonymous "tryit" keys are
+ *                           downgraded server-side and answer "does not
+ *                           support image attachments", so a refusal puts the
+ *                           provider on a cooldown instead of a permanent
+ *                           latch (a plan upgrade then just starts working).
+ *  2. OCR (ocr.space)     — reads screenshots, bills, error messages, notes.
+ *                           This covers most images people send a WhatsApp bot.
+ *  3. Honest fallback     — ask the user to describe it rather than inventing
+ *                           a description (the model will happily hallucinate).
  *
- * Every provider is optional and independently switchable.
+ * `describe()` also returns `attachmentUuids`, so AlexaAI can forward the file
+ * with the real conversation instead of a one-off side request.
  */
 class ImageDescriber {
     /**
@@ -32,173 +37,149 @@ class ImageDescriber {
         this.config = config;
         this.log = config.logger;
 
-        // Latches: once a provider proves unavailable, stop calling it.
-        this._deepaiVisionOff = false;
+        // Cooldown instead of a hard latch: vision may become available later.
+        this._visionCooldownUntil = 0;
+        this._visionCooldownMs = 30 * 60 * 1000;
+        this._modelsRefused = new Set();
         this._ocrOff = !config.ocrEnabled;
     }
 
+    /** True while DeepAI vision is known to be unavailable. */
+    get visionUnavailable() {
+        return Date.now() < this._visionCooldownUntil;
+    }
+
     /**
-     * @param {object} image  { buffer, url, mimetype, filename }
+     * @param {object} image  { buffer, url, base64, mimetype, filename }
      * @param {string} [caption]
-     * @returns {Promise<{ok:boolean, description:string|null, source:string|null, reason:string|null}>}
+     * @returns {Promise<{
+     *   ok:boolean, description:string|null, source:string|null,
+     *   reason:string|null, attachmentUuids:string[]
+     * }>}
      */
     async describe(image, caption = '') {
-        if (!image || (!image.buffer && !image.url)) {
-            return { ok: false, description: null, source: null, reason: 'no_image' };
+        if (!image || (!image.buffer && !image.url && !image.base64 && !image.data)) {
+            return ImageDescriber._fail('no_image');
         }
 
         // Make sure we have bytes; OCR needs them and so does the upload.
         const buffer = await this._resolveBuffer(image);
+        if (!buffer) return ImageDescriber._fail('unreadable');
 
-        // ---- 0. Documents: server-side extraction genuinely works --------
-        // Verified live: a .txt upload returns extraction_status 'complete'
-        // and its contents ARE injected into the model context.
-        if (buffer && ImageDescriber._isDocument(image)) {
-            const viaDoc = await this._tryDocument(buffer, image, caption);
-            if (viaDoc.ok) return viaDoc;
+        const isDocument = ImageDescriber._isDocument(image);
+
+        // Upload once and reuse the uuid for every provider attempt.
+        let uuid = null;
+        let extraction = null;
+        try {
+            const attachment = await this.client.uploadAttachment(
+                buffer,
+                image.filename || (isDocument ? 'document.txt' : 'image.jpg'),
+                image.mimetype || (isDocument ? 'text/plain' : 'image/jpeg')
+            );
+            uuid = attachment?.uuid ? String(attachment.uuid) : null;
+            if (uuid) {
+                const settled = (await this.client.getAttachment(uuid)) || attachment;
+                extraction = settled?.extraction_status || null;
+            }
+        } catch (err) {
+            if (this.config.debug) this.log.warn?.(`[AlexaAI] Attachment upload failed: ${err.message}`);
         }
 
-        // ---- 1. DeepAI native vision (paid keys) --------------------------
-        if (!this._deepaiVisionOff && buffer) {
-            const viaDeepAI = await this._tryDeepAI(buffer, image, caption);
-            if (viaDeepAI.ok) return viaDeepAI;
+        const uuids = uuid ? [uuid] : [];
+
+        // ---- 0. Documents: extraction genuinely works on free keys --------
+        if (uuid && isDocument && extraction === 'complete') {
+            const viaDoc = await this._ask(uuid, caption, {
+                document: true,
+                models: [this.config.model, ...this.config.visionModels],
+            });
+            if (viaDoc.ok) return { ...viaDoc, source: 'document', attachmentUuids: uuids };
+        }
+
+        // ---- 1. DeepAI native vision --------------------------------------
+        if (uuid && !isDocument && !this.visionUnavailable && extraction !== 'failed') {
+            const viaDeepAI = await this._ask(uuid, caption, { models: this.config.visionModels });
+            if (viaDeepAI.ok) return { ...viaDeepAI, source: 'deepai', attachmentUuids: uuids };
+            if (viaDeepAI.reason === 'plan') this._coolDownVision(extraction);
         }
 
         // ---- 2. OCR ---------------------------------------------------------
-        if (!this._ocrOff && buffer) {
+        if (!this._ocrOff) {
             const viaOcr = await this._tryOcr(buffer, image);
-            if (viaOcr.ok) return viaOcr;
+            if (viaOcr.ok) return { ...viaOcr, attachmentUuids: uuids };
         }
 
-        return { ok: false, description: null, source: null, reason: 'vision_unavailable' };
+        return { ...ImageDescriber._fail('vision_unavailable'), attachmentUuids: uuids };
     }
 
     // ------------------------------------------------------------ providers --
 
     /**
-     * @private DeepAI native attachment flow — the exact sequence the browser
-     * performs: upload -> get (await extraction) -> chat.
+     * @private Ask the model about an uploaded attachment, walking the model
+     * chain until one of them actually looks at it.
      *
-     * Two important details learned from probing the live API:
-     *
-     *  • Putting `attachment_uuids` INSIDE the message object force-downgrades
-     *    the request to `llama-3.1-8b-instruct-turbo` and returns
-     *    "does not support image attachments". Sending it ONLY as a top-level
-     *    form field keeps the chosen vision model selected.
-     *
-     *  • `extraction_status` tells us what the server actually did:
-     *      'complete' -> the file's text WAS injected into the model context
-     *      'skipped'  -> nothing was injected (images, on non-vision plans)
-     *      'failed'   -> extraction error
+     * IMPORTANT: `attachment_uuids` must be a TOP-LEVEL form field. Putting it
+     * inside the message object makes DeepAI downgrade the request to
+     * `llama-3.1-8b-instruct-turbo`, which then answers "does not support
+     * image attachments".
      */
-    async _tryDeepAI(buffer, image, caption) {
-        try {
-            const attachment = await this.client.uploadAttachment(
-                buffer,
-                image.filename || 'image.jpg',
-                image.mimetype || 'image/jpeg'
-            );
-            const uuid = attachment?.uuid;
-            if (!uuid) throw new Error('no uuid returned');
+    async _ask(uuid, caption, { models = [], document = false } = {}) {
+        const prompt = document
+            ? caption
+                ? `Using the attached document, answer: ${caption}`
+                : 'Summarise the attached document clearly and concisely.'
+            : caption
+              ? `Look at the attached image and answer: ${caption}`
+              : 'Describe the attached image in 2-3 sentences: the main subject, the setting, and any visible text.';
 
-            // Mirror the browser: confirm extraction state before chatting.
-            const settled = (await this.client.getAttachment(uuid)) || attachment;
-            const status = settled.extraction_status;
+        let sawRefusal = false;
+        for (const model of models.filter(Boolean)) {
+            if (this._modelsRefused.has(model)) continue;
+            try {
+                const reply = await this.client.chat([{ role: 'user', content: prompt }], {
+                    models: [model], // no silent fallback: we walk the chain ourselves
+                    attachmentUuids: [uuid],
+                });
 
-            // 'skipped' means the server attached NOTHING to the model context
-            // (no native vision on this plan). Calling chat now would only
-            // produce "I can't see images", so latch off and let OCR handle it.
-            if (status === 'skipped' || status === 'failed') {
-                this._deepaiVisionOff = true;
-                if (this.config.debug) {
-                    this.log.warn?.(
-                        `[AlexaAI] DeepAI did not process the image (extraction_status=${status}). ` +
-                            'Native vision requires a paid DeepAI plan — using OCR instead.'
-                    );
-                }
-                return { ok: false, description: null, source: null, reason: 'plan' };
-            }
-
-            const prompt = caption
-                ? `Look at the attached image and answer: ${caption}`
-                : 'Describe the attached image in 2-3 sentences: the main subject, the setting, and any visible text.';
-
-            const reply = await this.client.chat([{ role: 'user', content: prompt }], {
-                model: this.config.visionModel,
-                attachmentUuids: [uuid],
-            });
-
-            if (ImageDescriber._isRefusal(reply)) {
-                // Only latch vision off when the server told us it skipped the
-                // file. A one-off refusal on a 'complete' attachment may be
-                // transient, so don't disable the provider permanently.
-                if (status === 'skipped' || status === 'failed') {
-                    this._deepaiVisionOff = true;
+                if (ImageDescriber._isRefusal(reply)) {
+                    sawRefusal = true;
+                    this._modelsRefused.add(model);
                     if (this.config.debug) {
-                        this.log.warn?.(
-                            `[AlexaAI] DeepAI did not process the image (extraction_status=${status}). ` +
-                                'Native vision requires a paid DeepAI plan — falling back to OCR.'
-                        );
+                        this.log.warn?.(`[AlexaAI] ${model} cannot see attachments — trying the next model`);
                     }
+                    continue;
                 }
-                return { ok: false, description: null, source: null, reason: 'plan' };
-            }
-
-            return { ok: true, description: reply.trim(), source: 'deepai', reason: null };
-        } catch (err) {
-            const msg = String(err?.message || '').toLowerCase();
-            if (
-                msg.includes('does not support image') ||
-                msg.includes('only paid accounts') ||
-                msg.includes('vision-capable')
-            ) {
-                this._deepaiVisionOff = true;
-                if (this.config.debug) {
-                    this.log.warn?.('[AlexaAI] DeepAI vision unavailable on this plan — falling back to OCR.');
+                const text = String(reply || '').trim();
+                if (text) return { ok: true, description: text, source: null, reason: null };
+            } catch (err) {
+                const msg = String(err?.message || '').toLowerCase();
+                if (
+                    msg.includes('does not support image') ||
+                    msg.includes('only paid accounts') ||
+                    msg.includes('vision-capable') ||
+                    msg.includes('quota') ||
+                    msg.includes('paid users')
+                ) {
+                    sawRefusal = true;
+                    this._modelsRefused.add(model);
+                    continue;
                 }
-                return { ok: false, description: null, source: null, reason: 'plan' };
+                if (this.config.debug) this.log.warn?.(`[AlexaAI] Vision via ${model} failed: ${err.message}`);
             }
-            if (this.config.debug) this.log.warn?.(`[AlexaAI] DeepAI vision failed: ${err.message}`);
-            return { ok: false, description: null, source: null, reason: 'error' };
         }
+        return ImageDescriber._fail(sawRefusal ? 'plan' : 'error');
     }
 
-    /**
-     * @private Documents (txt / pdf / docx / csv ...) are extracted server-side
-     * and their text is injected into the model context — this works on FREE
-     * keys, unlike image vision.
-     */
-    async _tryDocument(buffer, image, caption) {
-        try {
-            const attachment = await this.client.uploadAttachment(
-                buffer,
-                image.filename || 'document.txt',
-                image.mimetype || 'text/plain'
+    /** @private Park DeepAI vision for a while after a plan refusal. */
+    _coolDownVision(extraction) {
+        this._visionCooldownUntil = Date.now() + this._visionCooldownMs;
+        this._modelsRefused.clear();
+        if (this.config.debug) {
+            this.log.warn?.(
+                `[AlexaAI] DeepAI did not process the image (extraction_status=${extraction}). ` +
+                    'Native vision needs a paid DeepAI plan — using OCR for the next 30 minutes.'
             );
-            const uuid = attachment?.uuid;
-            if (!uuid) return { ok: false, description: null, source: null, reason: 'error' };
-
-            const settled = (await this.client.getAttachment(uuid)) || attachment;
-            if (settled.extraction_status !== 'complete') {
-                return { ok: false, description: null, source: null, reason: 'not_extracted' };
-            }
-
-            const prompt = caption
-                ? `Using the attached document, answer: ${caption}`
-                : 'Summarise the attached document clearly and concisely.';
-
-            const reply = await this.client.chat([{ role: 'user', content: prompt }], {
-                model: this.config.visionModel,
-                attachmentUuids: [uuid],
-            });
-
-            if (ImageDescriber._isRefusal(reply)) {
-                return { ok: false, description: null, source: null, reason: 'refused' };
-            }
-            return { ok: true, description: reply.trim(), source: 'document', reason: null };
-        } catch (err) {
-            if (this.config.debug) this.log.warn?.(`[AlexaAI] Document extraction failed: ${err.message}`);
-            return { ok: false, description: null, source: null, reason: 'error' };
         }
     }
 
@@ -240,7 +221,7 @@ class ImageDescriber {
                 if (this.config.debug) {
                     this.log.warn?.(`[AlexaAI] OCR error: ${JSON.stringify(data.ErrorMessage)}`);
                 }
-                return { ok: false, description: null, source: null, reason: 'ocr_error' };
+                return ImageDescriber._fail('ocr_error');
             }
 
             const text = String(data?.ParsedResults?.[0]?.ParsedText || '')
@@ -249,9 +230,7 @@ class ImageDescriber {
                 .trim();
 
             // Empty = a photo with no text. Not a failure, just nothing to read.
-            if (text.length < 2) {
-                return { ok: false, description: null, source: null, reason: 'no_text' };
-            }
+            if (text.length < 2) return ImageDescriber._fail('no_text');
 
             const clipped = text.length > 2500 ? `${text.slice(0, 2500)}…` : text;
             return {
@@ -262,7 +241,7 @@ class ImageDescriber {
             };
         } catch (err) {
             if (this.config.debug) this.log.warn?.(`[AlexaAI] OCR failed: ${err.message}`);
-            return { ok: false, description: null, source: null, reason: 'ocr_error' };
+            return ImageDescriber._fail('ocr_error');
         } finally {
             clearTimeout(timer);
         }
@@ -270,25 +249,45 @@ class ImageDescriber {
 
     // -------------------------------------------------------------- helpers --
 
-    /** @private Ensure we have raw bytes, downloading a URL if needed. */
+    /** @private Ensure we have raw bytes: buffer, base64/data-URI, or URL. */
     async _resolveBuffer(image) {
-        if (image.buffer && Buffer.isBuffer(image.buffer)) return image.buffer;
-        if (!image.url) return null;
+        if (Buffer.isBuffer(image.buffer)) return ImageDescriber._cap(image.buffer, this.config.maxImageBytes);
+        if (image.buffer instanceof Uint8Array) {
+            return ImageDescriber._cap(Buffer.from(image.buffer), this.config.maxImageBytes);
+        }
 
+        const inline = image.base64 || image.data;
+        if (typeof inline === 'string' && inline) {
+            const payload = inline.startsWith('data:') ? inline.slice(inline.indexOf(',') + 1) : inline;
+            try {
+                return ImageDescriber._cap(Buffer.from(payload, 'base64'), this.config.maxImageBytes);
+            } catch {
+                return null;
+            }
+        }
+
+        if (!image.url) return null;
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), this.config.ocrTimeout);
         try {
             const response = await fetch(image.url, { signal: controller.signal });
             if (!response.ok) return null;
             const arrayBuffer = await response.arrayBuffer();
-            const buf = Buffer.from(arrayBuffer);
-            // Guard against someone linking a 50 MB file.
-            return buf.length > 12 * 1024 * 1024 ? null : buf;
+            return ImageDescriber._cap(Buffer.from(arrayBuffer), this.config.maxImageBytes);
         } catch {
             return null;
         } finally {
             clearTimeout(timer);
         }
+    }
+
+    static _cap(buffer, max) {
+        if (!buffer || !buffer.length) return null;
+        return buffer.length > max ? null : buffer;
+    }
+
+    static _fail(reason) {
+        return { ok: false, description: null, source: null, reason, attachmentUuids: [] };
     }
 
     /** @private Model said it cannot see the image. */
@@ -301,12 +300,13 @@ class ImageDescriber {
             lowered.includes('cannot view') ||
             lowered.includes('unable to view') ||
             lowered.includes('unable to see') ||
-            lowered.includes("not able to see") ||
+            lowered.includes('not able to see') ||
             lowered.includes('not able to view') ||
             lowered.includes("can't read or repeat") ||
             lowered.includes('does not support image') ||
             lowered.includes('no image') ||
-            lowered.includes("didn't receive an image")
+            lowered.includes("didn't receive an image") ||
+            lowered.includes('i do not have the ability to view')
         );
     }
 

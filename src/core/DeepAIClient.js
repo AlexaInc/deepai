@@ -1,31 +1,47 @@
 'use strict';
 
+const StreamParser = require('./StreamParser');
+const { STANDARD_APIS, TASK_TYPES } = require('./Endpoints');
 const { DeepAIError, QuotaExceededError } = require('./errors');
 
 /**
  * DeepAIClient
  * ------------
- * Thin, dependency-free transport for DeepAI's chat endpoint.
+ * Dependency-free transport for the **whole** DeepAI surface, not just the
+ * generative endpoint. Every request shape below was taken from the live
+ * deepai.org client source.
  *
- * Wire format was reverse-engineered from the live deepai.org client and
- * verified end-to-end against the production API:
+ * Chat
+ *   POST /hacking_is_a_serious_crime      multipart/form-data, header `api-key`
+ *        chat_style, chatHistory, model, session_uuid, sensitivity_request_id,
+ *        tool_activity_support, thinking_image_tool_support, enabled_tools,
+ *        attachment_uuids, memory_enabled, web_access_enabled, sandbox_enabled,
+ *        concierge_enabled, thinking_support, hacker_is_stinky
+ *        -> streamed UTF-8 text with embedded packets (see StreamParser), or
+ *           `{"task_id": "..."}` when thinking_support is on, or
+ *           `{"status": "..."}` on refusal.
+ *   GET  /check_chat_task_status?type=&task_id=
+ *   GET  /check-sensitivity?request_id=
  *
- *   POST https://api.deepai.org/hacking_is_a_serious_crime
- *   headers: { 'api-key': '<tryit key>' }
- *   multipart/form-data:
- *     chat_style       = "chat"
- *     chatHistory      = JSON.stringify([{role, content}, ...])
- *     model            = "standard" | "gpt-4o-mini" | ...
- *     hacker_is_stinky = "very_stinky"
+ * Attachments
+ *   POST /chat_attachments/upload         file -> { success, attachment:{uuid,…} }
+ *   GET  /chat_attachments/get?uuid=      extraction_status: pending|complete|skipped|failed
  *
- * The response body is plain streamed UTF-8 text (NOT JSON, NOT SSE).
- * Errors arrive as a JSON object shaped `{"status": "..."}`.
+ * Sessions            /save_chat_session /get_chat_session /rename_chat_session
+ *                     /delete_chat_session /delete_all_chat_history
+ * Settings            /chat_memory /chat_sandbox /chat_concierge
+ * Moderation          /report_character
+ * Classic public API  /api/text2img, /api/image-editor, /api/torch-srgan, …
  */
 class DeepAIClient {
     /** @param {import('./Config')} config */
     constructor(config) {
         this.config = config;
         this.log = config.logger;
+
+        this._keys = [...config.keys];
+        this._keyIndex = 0;
+        this.sessionUuid = DeepAIClient.uuid();
 
         if (typeof fetch !== 'function') {
             throw new DeepAIError(
@@ -35,175 +51,363 @@ class DeepAIClient {
         }
     }
 
+    // =====================================================================
+    //  Keys
+    // =====================================================================
+
+    /** The api-key used for the next request. */
+    get apiKey() {
+        return this._keys[this._keyIndex] || this.config.key;
+    }
+
     /**
-     * Send a chat history and return the assistant's raw reply text.
-     * @param {Array<{role:string, content:string, attachment_uuids?:string[]}>} messages
+     * Move to the next configured key (or mint an anonymous one when
+     * `autoKeyRotation` is enabled). Returns false when nothing is left.
+     */
+    rotateKey() {
+        if (this._keyIndex + 1 < this._keys.length) {
+            this._keyIndex++;
+            if (this.config.debug) this.log.warn?.('[AlexaAI] Rotating to the next DeepAI key');
+            return true;
+        }
+        if (this.config.autoKeyRotation) {
+            const fresh = DeepAIClient.generateTryItKey();
+            this._keys.push(fresh);
+            this._keyIndex = this._keys.length - 1;
+            if (this.config.debug) this.log.warn?.('[AlexaAI] Minted a fresh anonymous DeepAI key');
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Anonymous "try it" key in the shape deepai.org generates in-browser:
+     * `tryit-<10 digits>-<32 hex>`.
+     */
+    static generateTryItKey() {
+        const digits = Array.from({ length: 10 }, () => Math.floor(Math.random() * 10)).join('');
+        const hex = Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+        return `tryit-${digits}-${hex}`;
+    }
+
+    /** Browser-identical headers. DeepAI rejects requests without an origin. */
+    headers(extra = {}) {
+        return {
+            'api-key': this.apiKey,
+            Origin: this.config.origin,
+            Referer: `${this.config.origin}/`,
+            'User-Agent': this.config.userAgent,
+            ...extra,
+        };
+    }
+
+    // =====================================================================
+    //  Chat
+    // =====================================================================
+
+    /**
+     * Send a chat history and return the assistant's reply.
+     *
+     * @param {Array<{role:string, content:string}>} messages
      * @param {object} [options]
      * @param {string} [options.model]
      * @param {string[]} [options.attachmentUuids]
+     * @param {string[]} [options.models]            explicit fallback chain
+     * @param {boolean} [options.thinking]
+     * @param {boolean} [options.webAccess]
+     * @param {boolean} [options.search]             force the online/search flags
+     * @param {string} [options.chatStyle]
+     * @param {string} [options.sessionUuid]
+     * @param {(chunk:string, full:string)=>void} [options.onToken] streaming callback
      * @param {AbortSignal} [options.signal]
-     * @returns {Promise<string>}
+     * @returns {Promise<string>} the assistant text (packets stripped)
      */
     async chat(messages, options = {}) {
-        const model = options.model || this.config.model;
-        const attempts = this.config.maxRetries + 1;
-        let lastError;
-
-        for (let attempt = 1; attempt <= attempts; attempt++) {
-            try {
-                return await this._request(messages, model, options);
-            } catch (err) {
-                lastError = err;
-
-                // Never retry a definitive refusal (quota / paid model / bad key).
-                if (err instanceof QuotaExceededError || err.retryable === false) throw err;
-                if (attempt === attempts) break;
-
-                const delay = this.config.retryDelay * attempt;
-                if (this.config.debug) {
-                    this.log.warn?.(`[AlexaAI] DeepAI attempt ${attempt}/${attempts} failed (${err.message}); retrying in ${delay}ms`);
-                }
-                await DeepAIClient._sleep(delay);
-            }
-        }
-        throw lastError;
+        const result = await this.chatDetailed(messages, options);
+        return result.text;
     }
 
-    /** @private */
-    async _request(messages, model, options) {
-        const form = new FormData();
-        form.append('chat_style', this.config.chatStyle);
-        form.append('chatHistory', JSON.stringify(messages));
-        form.append('model', model);
-        form.append('hacker_is_stinky', 'very_stinky');
+    /**
+     * Same as `chat()` but returns everything the stream carried:
+     * `{ text, payload, images, functionCall, webResults, thinking, toolActivity, model }`.
+     */
+    async chatDetailed(messages, options = {}) {
+        const chain = DeepAIClient._modelChain(options, this.config);
+        const maxAttempts = this.config.maxRetries + 1;
 
-        if (Array.isArray(options.attachmentUuids) && options.attachmentUuids.length) {
-            // Mirror the browser's exact field set for attachment requests.
-            form.append('attachment_uuids', JSON.stringify(options.attachmentUuids));
-            form.append('session_uuid', options.sessionUuid || DeepAIClient._uuid());
-            form.append('sensitivity_request_id', DeepAIClient._uuid());
-            form.append('tool_activity_support', '1');
-            form.append('thinking_image_tool_support', '1');
-            form.append('enabled_tools', JSON.stringify(['image_generator', 'image_editor']));
+        let lastError;
+        for (const model of chain) {
+            let attempt = 0;
+            // A quota refusal is not a failure of the model — it is a failure
+            // of the key, so trying the next key does not consume an attempt.
+            let keySwaps = this._keys.length + (this.config.autoKeyRotation ? 2 : 0);
+
+            for (;;) {
+                attempt++;
+                try {
+                    const parsed = await this._chatOnce(messages, model, options);
+                    return { ...parsed, model };
+                } catch (err) {
+                    lastError = err;
+
+                    if (err instanceof QuotaExceededError) {
+                        if (keySwaps-- > 0 && this.rotateKey()) {
+                            attempt = 0;
+                            continue;
+                        }
+                        break; // every key is spent: fall through to the next model
+                    }
+                    if (err.retryable === false) break;
+                    if (attempt >= maxAttempts) break;
+
+                    const delay = this.config.retryDelay * attempt;
+                    if (this.config.debug) {
+                        this.log.warn?.(
+                            `[AlexaAI] DeepAI ${model} attempt ${attempt}/${maxAttempts} failed (${err.message}); retrying in ${delay}ms`
+                        );
+                    }
+                    await DeepAIClient.sleep(delay);
+                }
+            }
         }
+        throw lastError || new DeepAIError('DeepAI request failed', { code: 'DEEPAI_ERROR' });
+    }
 
+    /** @private one request against one model. */
+    async _chatOnce(messages, model, options) {
+        const form = this.buildChatForm(messages, model, options);
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), this.config.timeout);
-
-        // Caller-supplied signal chains into ours.
-        if (options.signal) {
-            if (options.signal.aborted) controller.abort();
-            else options.signal.addEventListener('abort', () => controller.abort(), { once: true });
-        }
+        const signal = DeepAIClient._linkSignals(controller, options.signal);
 
         let response;
         try {
-            response = await fetch(this.config.chatUrl, {
+            response = await fetch(this.config.url('chat'), {
                 method: 'POST',
                 body: form,
-                headers: {
-                    'api-key': this.config.key,
-                    Origin: 'https://deepai.org',
-                    Referer: 'https://deepai.org/',
-                    'User-Agent':
-                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-                },
-                signal: controller.signal,
+                headers: this.headers(),
+                signal,
             });
         } catch (err) {
+            clearTimeout(timer);
+            if (err.name === 'AbortError' && options.signal?.aborted) {
+                throw new DeepAIError('Chat request cancelled', { code: 'ABORTED', retryable: false });
+            }
             if (err.name === 'AbortError') {
-                throw new DeepAIError(`DeepAI request timed out after ${this.config.timeout}ms`, {
+                throw new DeepAIError(`DeepAI timed out after ${this.config.timeout}ms`, {
                     code: 'DEEPAI_TIMEOUT',
                     retryable: true,
-                    cause: err,
                 });
             }
-            throw new DeepAIError(`Network error contacting DeepAI: ${err.message}`, {
+            throw new DeepAIError(`DeepAI network error: ${err.message}`, {
                 code: 'DEEPAI_NETWORK',
                 retryable: true,
                 cause: err,
             });
+        }
+
+        try {
+            if (response.status > 299) {
+                const body = await response.text();
+                throw DeepAIClient._toError(response.status, body);
+            }
+
+            // Reasoning models answer with { task_id } and finish asynchronously.
+            const contentType = response.headers.get('content-type') || '';
+            if (options.thinking ?? this.config.thinkingSupport) {
+                const body = await response.text();
+                const task = DeepAIClient._safeJson(body);
+                if (task?.task_id) {
+                    const finished = await this.waitForTask(task.task_id, {
+                        type: TASK_TYPES.thinking,
+                        signal: options.signal,
+                    });
+                    return StreamParser.parse(DeepAIClient._taskText(finished));
+                }
+                if (task?.status) throw DeepAIClient._toError(response.status, body);
+                return StreamParser.parse(body);
+            }
+
+            const raw = await this._readStream(response, options.onToken);
+
+            // Refusals arrive as a short JSON body even with HTTP 200.
+            const status = DeepAIClient._detectJsonStatus(raw);
+            if (status) throw DeepAIClient._toError(response.status, raw, status);
+            if (contentType.includes('application/json') && !raw.trim()) {
+                throw new DeepAIError('DeepAI returned an empty body', {
+                    code: 'DEEPAI_EMPTY',
+                    retryable: true,
+                });
+            }
+
+            const parsed = StreamParser.parse(raw);
+            if (!parsed.text && !parsed.payload) {
+                throw new DeepAIError('DeepAI returned an empty reply', {
+                    code: 'DEEPAI_EMPTY',
+                    retryable: true,
+                });
+            }
+            parsed.raw = raw;
+            return parsed;
         } finally {
             clearTimeout(timer);
         }
-
-        const text = (await response.text()) ?? '';
-
-        if (!response.ok) {
-            throw DeepAIClient._toError(response.status, text);
-        }
-
-        // A 200 can still carry a JSON refusal such as
-        // {"status": "Only paid accounts can use genius"}.
-        const refusal = DeepAIClient._detectJsonStatus(text);
-        if (refusal) throw DeepAIClient._toError(200, text, refusal);
-
-        const reply = text.trim();
-        if (!reply) {
-            throw new DeepAIError('DeepAI returned an empty response', {
-                code: 'DEEPAI_EMPTY',
-                retryable: true,
-            });
-        }
-        return reply;
     }
 
     /**
-     * Upload a file and return its attachment descriptor.
-     * IMPORTANT: this endpoint rejects the `api-key` header ("Invalid
-     * authentication credentials") but accepts an anonymous request that
-     * carries an Origin header. Verified against the live API.
-     * @param {Buffer} buffer
-     * @param {string} filename
-     * @param {string} mimetype
-     * @returns {Promise<{uuid:string, download_url:string, content_type:string}>}
+     * Exactly the form the browser posts. Exposed so the host bot (and tests)
+     * can inspect or extend it.
+     * @returns {FormData}
+     */
+    buildChatForm(messages, model, options = {}) {
+        const cfg = this.config;
+        const form = new FormData();
+
+        form.append('chat_style', options.chatStyle || cfg.chatStyle);
+        form.append('chatHistory', JSON.stringify(messages));
+        form.append('model', model || cfg.model);
+        form.append('hacker_is_stinky', 'very_stinky');
+
+        if (cfg.sendSessionUuid) form.append('session_uuid', options.sessionUuid || this.sessionUuid);
+        if (options.sensitivityRequestId) form.append('sensitivity_request_id', options.sensitivityRequestId);
+        if (cfg.toolActivitySupport) form.append('tool_activity_support', '1');
+        if (cfg.thinkingImageToolSupport) form.append('thinking_image_tool_support', '1');
+        if (options.thinking ?? cfg.thinkingSupport) form.append('thinking_support', '1');
+
+        const memoryEnabled = options.serverMemory ?? cfg.serverMemory;
+        if (memoryEnabled !== undefined) form.append('memory_enabled', memoryEnabled ? 'true' : 'false');
+        const webAccess = options.webAccess ?? cfg.webAccess;
+        if (webAccess !== undefined) form.append('web_access_enabled', webAccess ? 'true' : 'false');
+        if (options.sandbox ?? cfg.sandbox) {
+            form.append('sandbox_enabled', 'true');
+            form.append('sandbox_turn_id', options.sandboxTurnId || DeepAIClient.uuid());
+        }
+        if (options.concierge ?? cfg.concierge) form.append('concierge_enabled', 'true');
+
+        if (cfg.enabledTools.length) form.append('enabled_tools', JSON.stringify(cfg.enabledTools));
+
+        if (options.summary) form.append('summary', 'summary');
+        if (options.search) {
+            form.append('online', 'online');
+            form.append('search', 'search');
+        }
+
+        // Attachments ride as a TOP-LEVEL field. Putting them inside a message
+        // object makes DeepAI downgrade the request to a text-only model.
+        const uuids = Array.isArray(options.attachmentUuids) ? options.attachmentUuids.filter(Boolean) : [];
+        if (uuids.length) form.append('attachment_uuids', JSON.stringify(uuids.map(String)));
+
+        for (const [field, value] of Object.entries(options.extraFields || {})) {
+            form.append(field, typeof value === 'string' ? value : JSON.stringify(value));
+        }
+        return form;
+    }
+
+    /** @private Read the streamed body, feeding `onToken` as text arrives. */
+    async _readStream(response, onToken) {
+        if (!response.body || typeof response.body.getReader !== 'function') {
+            return response.text();
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let full = '';
+        let emitted = '';
+
+        for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            full += decoder.decode(value, { stream: true });
+            if (typeof onToken === 'function') {
+                // Only hand the caller clean, packet-free prose.
+                const visible = StreamParser.parse(full).text;
+                if (visible.length > emitted.length) {
+                    const delta = visible.slice(emitted.length);
+                    emitted = visible;
+                    try {
+                        onToken(delta, visible);
+                    } catch {
+                        /* a broken consumer must not kill the stream */
+                    }
+                }
+            }
+        }
+        full += decoder.decode();
+        return full;
+    }
+
+    // =====================================================================
+    //  Background tasks  (/check_chat_task_status)
+    // =====================================================================
+
+    /** One poll of a background task. */
+    async taskStatus(taskId, type = TASK_TYPES.thinking) {
+        return this._json(this.config.url('taskStatus', { type, task_id: taskId }), { method: 'GET' });
+    }
+
+    /** Poll until a task completes, fails, or `taskPollTimeout` elapses. */
+    async waitForTask(taskId, { type = TASK_TYPES.thinking, signal = null } = {}) {
+        const deadline = Date.now() + this.config.taskPollTimeout;
+        let last = null;
+        while (Date.now() < deadline) {
+            if (signal?.aborted) throw new DeepAIError('Task polling cancelled', { code: 'ABORTED', retryable: false });
+            try {
+                last = await this.taskStatus(taskId, type);
+            } catch (err) {
+                if (err instanceof QuotaExceededError) throw err;
+                last = null;
+            }
+            const status = String(last?.status || '').toUpperCase();
+            if (status === 'COMPLETED' || status === 'COMPLETE' || status === 'SUCCESS') return last;
+            if (status === 'FAILED' || status === 'ERROR') {
+                throw new DeepAIError(`DeepAI task failed: ${last?.error || status}`, {
+                    code: 'DEEPAI_TASK_FAILED',
+                    retryable: false,
+                });
+            }
+            await DeepAIClient.sleep(this.config.taskPollInterval);
+        }
+        throw new DeepAIError('DeepAI task timed out', { code: 'DEEPAI_TASK_TIMEOUT', retryable: true });
+    }
+
+    /** Sensitivity score for a chat turn (`sensitivity_request_id`). */
+    async checkSensitivity(requestId) {
+        try {
+            const data = await this._json(this.config.url('sensitivity', { request_id: requestId }), {
+                method: 'GET',
+            });
+            return typeof data?.score === 'number' ? data.score : null;
+        } catch {
+            return null; // never let telemetry break a reply
+        }
+    }
+
+    // =====================================================================
+    //  Attachments
+    // =====================================================================
+
+    /**
+     * Upload a file so it can be referenced by `attachment_uuids`.
+     * @param {Buffer|Uint8Array} buffer
+     * @param {string} [filename]
+     * @param {string} [mimetype]
+     * @returns {Promise<object>} attachment row
      */
     async uploadAttachment(buffer, filename = 'image.jpg', mimetype = 'image/jpeg') {
         const form = new FormData();
         form.append('file', new Blob([buffer], { type: mimetype }), filename);
 
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), this.config.timeout);
-
-        try {
-            const response = await fetch(this.config.uploadUrl, {
-                method: 'POST',
-                body: form,
-                headers: { Origin: 'https://deepai.org', Referer: 'https://deepai.org/' },
-                signal: controller.signal,
+        const data = await this._json(this.config.url('attachmentUpload'), {
+            method: 'POST',
+            body: form,
+            errorCode: 'UPLOAD_FAILED',
+        });
+        if (!data.success || !data.attachment) {
+            throw new DeepAIError(data.error || 'Attachment upload failed', {
+                code: 'UPLOAD_FAILED',
+                body: data,
             });
-            const text = await response.text();
-            let data;
-            try {
-                data = JSON.parse(text);
-            } catch {
-                throw new DeepAIError(`Attachment upload returned non-JSON: ${text.slice(0, 200)}`, {
-                    code: 'UPLOAD_BAD_RESPONSE',
-                    status: response.status,
-                    retryable: true,
-                });
-            }
-            if (!data.success || !data.attachment) {
-                throw new DeepAIError(data.error || 'Attachment upload failed', {
-                    code: 'UPLOAD_FAILED',
-                    status: response.status,
-                    body: data,
-                });
-            }
-            return data.attachment;
-        } catch (err) {
-            if (err instanceof DeepAIError) throw err;
-            if (err.name === 'AbortError') {
-                throw new DeepAIError('Attachment upload timed out', { code: 'UPLOAD_TIMEOUT', retryable: true });
-            }
-            throw new DeepAIError(`Attachment upload error: ${err.message}`, {
-                code: 'UPLOAD_NETWORK',
-                retryable: true,
-                cause: err,
-            });
-        } finally {
-            clearTimeout(timer);
         }
+        return data.attachment;
     }
 
     /**
@@ -217,21 +421,266 @@ class DeepAIClient {
     async getAttachment(uuid, attempts = 3) {
         for (let i = 0; i < attempts; i++) {
             try {
-                const response = await fetch(
-                    `${this.config.baseUrl}/chat_attachments/get?uuid=${encodeURIComponent(uuid)}`,
-                    { headers: { Origin: 'https://deepai.org', Referer: 'https://deepai.org/' } }
-                );
-                const data = await response.json();
+                const data = await this._json(this.config.url('attachmentGet', { uuid }), { method: 'GET' });
                 const status = data?.attachment?.extraction_status;
-                if (data?.success && status !== 'pending' && status !== 'processing') {
-                    return data.attachment;
-                }
+                if (data?.success && status !== 'pending' && status !== 'processing') return data.attachment;
             } catch {
                 /* retry */
             }
-            await DeepAIClient._sleep(1200);
+            await DeepAIClient.sleep(1200);
         }
         return null;
+    }
+
+    // =====================================================================
+    //  Server-side chat sessions
+    // =====================================================================
+
+    /** Persist a transcript on DeepAI (`/save_chat_session`). */
+    async saveSession({ uuid = this.sessionUuid, title = '', messages = [], model, chatStyle } = {}) {
+        const form = new FormData();
+        form.append('uuid', uuid);
+        form.append('title', title || '');
+        form.append('chat_style', chatStyle || this.config.chatStyle);
+        form.append('chat_model', model || this.config.model);
+        form.append('messages', JSON.stringify(messages));
+        return this._json(this.config.url('saveSession'), { method: 'POST', body: form });
+    }
+
+    /** Load a transcript (`/get_chat_session`). */
+    async getSession(uuid) {
+        return this._json(this.config.url('getSession', { uuid }), { method: 'GET' });
+    }
+
+    /** Rename a transcript (`/rename_chat_session`). */
+    async renameSession(uuid, title) {
+        const form = new FormData();
+        form.append('uuid', uuid);
+        form.append('title', String(title ?? ''));
+        return this._json(this.config.url('renameSession'), { method: 'POST', body: form });
+    }
+
+    /** Delete one transcript (`/delete_chat_session`). */
+    async deleteSession(uuid) {
+        const form = new FormData();
+        form.append('uuid', uuid);
+        return this._json(this.config.url('deleteSession'), { method: 'POST', body: form });
+    }
+
+    /** Delete every transcript (`/delete_all_chat_history`). */
+    async deleteAllSessions(knownUuids = []) {
+        const form = new FormData();
+        form.append('my_known_uuids', JSON.stringify(knownUuids));
+        return this._json(this.config.url('deleteAllSessions'), { method: 'POST', body: form });
+    }
+
+    // =====================================================================
+    //  Account-level settings
+    // =====================================================================
+
+    /**
+     * DeepAI's own long-term memory profile (`/chat_memory`).
+     * `action` is omitted to read, or one of the site's actions to write
+     * (e.g. 'refresh', 'set_enabled', 'set_profile').
+     */
+    async chatMemory(action = null, fields = {}) {
+        return this._settings('memory', action, fields);
+    }
+
+    /** Agent-mode toggle (`/chat_sandbox`). */
+    async chatSandbox(enabled) {
+        return this._settings('sandbox', enabled === undefined ? null : 'set_enabled', {
+            enabled: enabled ? 'true' : 'false',
+        });
+    }
+
+    /** Background-task toggle (`/chat_concierge`). */
+    async chatConcierge(enabled) {
+        return this._settings('concierge', enabled === undefined ? null : 'set_enabled', {
+            enabled: enabled ? 'true' : 'false',
+        });
+    }
+
+    /** Abuse report for a character chat (`/report_character`). */
+    async reportCharacter({ reason, characterUrl = null, history = [] }) {
+        const form = new FormData();
+        form.append('reason', String(reason ?? ''));
+        if (characterUrl) form.append('character_url', characterUrl);
+        form.append('chat_history', JSON.stringify(history));
+        return this._json(this.config.url('reportCharacter'), { method: 'POST', body: form });
+    }
+
+    /** @private GET-to-read / POST-to-write settings endpoints. */
+    async _settings(endpoint, action, fields) {
+        const url = this.config.url(endpoint);
+        if (!action) return this._json(url, { method: 'GET' });
+        const form = new FormData();
+        form.append('action', action);
+        for (const [k, v] of Object.entries(fields || {})) form.append(k, String(v));
+        return this._json(url, { method: 'POST', body: form });
+    }
+
+    // =====================================================================
+    //  Classic public API  (/api/<name>)
+    // =====================================================================
+
+    /**
+     * Call any endpoint of DeepAI's public API family.
+     *
+     *   runApi('text2img', { text: 'a cat' })
+     *   runApi('torch-srgan', { image: buffer })
+     *   runApi('nsfw-detector', { image: 'https://…' })
+     *
+     * Buffers/Uint8Arrays are uploaded as files, everything else as fields.
+     * @returns {Promise<object>} e.g. `{ id, output_url }`
+     */
+    async runApi(name, fields = {}, options = {}) {
+        const form = new FormData();
+        for (const [key, value] of Object.entries(fields)) {
+            if (value == null) continue;
+            if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+                form.append(key, new Blob([value]), options.filename || `${key}.bin`);
+            } else if (typeof value === 'object' && value.buffer) {
+                form.append(
+                    key,
+                    new Blob([value.buffer], { type: value.mimetype || 'application/octet-stream' }),
+                    value.filename || `${key}.bin`
+                );
+            } else {
+                form.append(key, String(value));
+            }
+        }
+        const url = `${this.config.url('api')}/${String(name).replace(/^\/+/, '')}`;
+        const data = await this._json(url, { method: 'POST', body: form, signal: options.signal });
+        if (data?.err) {
+            throw DeepAIClient._toError(200, JSON.stringify(data), data.err);
+        }
+        return data;
+    }
+
+    /** Text-to-image (`/api/text2img`). Returns `{ id, output_url }`. */
+    async text2img(text, extra = {}) {
+        return this.runApi(this.config.imageModel || STANDARD_APIS.text2img, { text, ...extra });
+    }
+
+    /** Prompt-driven image edit (`/api/image-editor`). */
+    async editImage(image, text, extra = {}) {
+        return this.runApi(STANDARD_APIS.imageEditor, { image, text, ...extra });
+    }
+
+    /** 4x upscale (`/api/torch-srgan`). */
+    async upscaleImage(image, extra = {}) {
+        return this.runApi(STANDARD_APIS.superResolution, { image, ...extra });
+    }
+
+    /** Colourise a black-and-white photo (`/api/colorizer`). */
+    async colorizeImage(image, extra = {}) {
+        return this.runApi(STANDARD_APIS.colorizer, { image, ...extra });
+    }
+
+    /** NSFW score (`/api/nsfw-detector`). */
+    async detectNsfw(image, extra = {}) {
+        return this.runApi(STANDARD_APIS.nsfwDetector, { image, ...extra });
+    }
+
+    /** Abstractive summary (`/api/summarization`). */
+    async summarize(text, extra = {}) {
+        return this.runApi(STANDARD_APIS.summarization, { text, ...extra });
+    }
+
+    /** Sentiment labels (`/api/sentiment-analysis`). */
+    async sentiment(text, extra = {}) {
+        return this.runApi(STANDARD_APIS.sentiment, { text, ...extra });
+    }
+
+    // =====================================================================
+    //  Internals
+    // =====================================================================
+
+    /** @private JSON request with uniform timeout + error handling. */
+    async _json(url, { method = 'GET', body = null, headers = {}, signal = null, errorCode = null } = {}) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), this.config.timeout);
+        const linked = DeepAIClient._linkSignals(controller, signal);
+
+        try {
+            const response = await fetch(url, {
+                method,
+                body,
+                headers: this.headers(headers),
+                signal: linked,
+            });
+            const text = await response.text();
+            const data = DeepAIClient._safeJson(text);
+
+            if (response.status > 299) {
+                throw DeepAIClient._toError(response.status, text, data?.status || data?.error);
+            }
+            if (data === null) {
+                throw new DeepAIError(`DeepAI returned non-JSON from ${url}: ${text.slice(0, 200)}`, {
+                    code: errorCode || 'BAD_RESPONSE',
+                    status: response.status,
+                    retryable: true,
+                });
+            }
+            if (typeof data.status === 'string' && DeepAIClient._isRefusal(data.status)) {
+                throw DeepAIClient._toError(response.status, text, data.status);
+            }
+            return data;
+        } catch (err) {
+            if (err instanceof DeepAIError) throw err;
+            if (err.name === 'AbortError') {
+                throw new DeepAIError(`DeepAI request to ${url} timed out`, {
+                    code: 'DEEPAI_TIMEOUT',
+                    retryable: true,
+                });
+            }
+            throw new DeepAIError(`DeepAI request to ${url} failed: ${err.message}`, {
+                code: errorCode || 'DEEPAI_NETWORK',
+                retryable: true,
+                cause: err,
+            });
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    /** @private models to try, in order. */
+    static _modelChain(options, config) {
+        if (Array.isArray(options.models) && options.models.length) return options.models;
+        const primary = options.model || config.model;
+        return [primary, ...config.fallbackModels.filter((m) => m !== primary)];
+    }
+
+    /** @private the assistant text carried by a finished thinking task. */
+    static _taskText(task) {
+        if (!task) return '';
+        return (
+            task.result ||
+            task.response ||
+            task.output ||
+            task.text ||
+            (typeof task.data === 'string' ? task.data : '') ||
+            ''
+        );
+    }
+
+    /** @private tie an external AbortSignal to our timeout controller. */
+    static _linkSignals(controller, external) {
+        if (external) {
+            if (external.aborted) controller.abort();
+            else external.addEventListener?.('abort', () => controller.abort(), { once: true });
+        }
+        return controller.signal;
+    }
+
+    static _safeJson(text) {
+        try {
+            const parsed = JSON.parse(text);
+            return parsed && typeof parsed === 'object' ? parsed : null;
+        } catch {
+            return null;
+        }
     }
 
     /**
@@ -240,7 +689,7 @@ class DeepAIClient {
      * @private
      */
     static _detectJsonStatus(text) {
-        const trimmed = text.trim();
+        const trimmed = String(text ?? '').trim();
         if (!trimmed.startsWith('{') || trimmed.length > 600) return null;
         try {
             const parsed = JSON.parse(trimmed);
@@ -252,19 +701,26 @@ class DeepAIClient {
         return null;
     }
 
+    static _isRefusal(status) {
+        return /exceeded|paid|credits|api-key|login|not allowed|forbidden/i.test(status);
+    }
+
     /** @private */
     static _toError(status, body, statusMessage) {
         const msg = statusMessage || DeepAIClient._detectJsonStatus(body) || `HTTP ${status}`;
-        const lowered = msg.toLowerCase();
+        const lowered = String(msg).toLowerCase();
 
         const quotaHints = [
             'quota exceeded',
             'try it exceeded',
+            'try-it quota exceeded',
             'only paid accounts',
             'paid users',
             'out of credits',
             'invalid authentication',
             'api key',
+            'api-key',
+            'please login',
         ];
         if (quotaHints.some((h) => lowered.includes(h))) {
             return new QuotaExceededError(`DeepAI refused the request: ${msg}`, { status, body });
@@ -274,13 +730,13 @@ class DeepAIClient {
         const retryable = status >= 500 || status === 429 || status === 408;
         return new DeepAIError(`DeepAI request failed: ${msg}`, {
             status,
-            body: body?.slice?.(0, 500),
+            body: typeof body === 'string' ? body.slice(0, 500) : body,
             retryable,
         });
     }
 
-    /** @private RFC4122 v4, without pulling in a dependency. */
-    static _uuid() {
+    /** RFC4122 v4, without pulling in a dependency. */
+    static uuid() {
         if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
         return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
             const r = (Math.random() * 16) | 0;
@@ -288,8 +744,17 @@ class DeepAIClient {
         });
     }
 
-    static _sleep(ms) {
+    static sleep(ms) {
         return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    /** @deprecated kept for older call sites */
+    static _uuid() {
+        return DeepAIClient.uuid();
+    }
+
+    static _sleep(ms) {
+        return DeepAIClient.sleep(ms);
     }
 }
 
