@@ -32,8 +32,23 @@ class UserRepository {
         const pushName = UserRepository._clean(info.pushName, 128);
         const metadata = info.metadata && typeof info.metadata === 'object' ? info.metadata : {};
 
+        // If this jid is already a known ALIAS of somebody, that person is who
+        // is writing — creating a second row here is exactly the bug that made
+        // Alexa forget people between a DM and a group.
+        const known = await this.db.one(
+            `SELECT u.* FROM wa_users u
+               JOIN wa_user_identities i ON i.user_id = u.id
+              WHERE i.jid = $1
+              LIMIT 1`,
+            [parsed.jid]
+        );
+        if (known) {
+            await this.db.query('UPDATE wa_user_identities SET last_seen_at = NOW() WHERE jid = $1', [parsed.jid]);
+            return (await this.touch(known.id, { pushName, metadata })) || known;
+        }
+
         // COALESCE keeps a previously-known push name if this event lacks one.
-        return this.db.one(
+        const user = await this.db.one(
             `INSERT INTO wa_users (jid, jid_local, jid_server, jid_type, phone, push_name, metadata, last_seen_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NOW())
              ON CONFLICT (jid) DO UPDATE
@@ -52,6 +67,39 @@ class UserRepository {
                 JSON.stringify(metadata),
             ]
         );
+
+        // Every user is their own primary identity. DO NOTHING on conflict:
+        // re-pointing a jid at another person is IdentityRepository's job, and
+        // it merges instead of silently stealing the alias.
+        await this.db.query(
+            `INSERT INTO wa_user_identities (user_id, jid, jid_local, jid_server, jid_type, phone, is_primary, source)
+             VALUES ($1, $2, $3, $4, $5, $6, TRUE, 'primary')
+             ON CONFLICT (jid) DO UPDATE SET last_seen_at = NOW()`,
+            [user.id, parsed.jid, parsed.local, parsed.server, parsed.type, parsed.phone]
+        );
+
+        return user;
+    }
+
+    /** Refresh `last_seen_at` / push name on a known row. */
+    async touch(userId, info = {}) {
+        if (!userId) return null;
+        const pushName = UserRepository._clean(info.pushName, 128);
+        const metadata = info.metadata && typeof info.metadata === 'object' ? info.metadata : {};
+        return this.db.one(
+            `UPDATE wa_users
+                SET last_seen_at = NOW(),
+                    push_name    = COALESCE(NULLIF($2, ''), push_name),
+                    metadata     = metadata || $3::jsonb
+              WHERE id = $1
+              RETURNING *`,
+            [userId, pushName, JSON.stringify(metadata)]
+        );
+    }
+
+    async findById(userId) {
+        if (!userId) return null;
+        return this.db.one('SELECT * FROM wa_users WHERE id = $1', [userId]);
     }
 
     /**
@@ -98,10 +146,23 @@ class UserRepository {
         );
     }
 
+    /**
+     * Look a user up by ANY address they are known under — the row itself or
+     * one of their linked aliases (`@lid` <-> phone jid).
+     */
     async findByJid(rawJid) {
         const jid = JidParser.normalize(rawJid);
         if (!jid) return null;
-        return this.db.one('SELECT * FROM wa_users WHERE jid = $1', [jid]);
+        return this.db.one(
+            `SELECT u.* FROM wa_users u
+              WHERE u.jid = $1
+              UNION
+             SELECT u.* FROM wa_users u
+               JOIN wa_user_identities i ON i.user_id = u.id
+              WHERE i.jid = $1
+              LIMIT 1`,
+            [jid]
+        );
     }
 
     async findGroupByJid(rawJid) {

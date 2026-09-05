@@ -1,7 +1,7 @@
 {
   "name": "alexa-ai",
-  "version": "1.0.0",
-  "description": "Object-oriented DeepAI-powered AI engine for the Alexa WhatsApp bot, with PostgreSQL-backed user management and long-term memory.",
+  "version": "2.0.0",
+  "description": "Object-oriented DeepAI-powered AI engine for the Alexa WhatsApp bot: full DeepAI API surface, cross-chat identity linking (@lid <-> phone) and PostgreSQL-backed long-term memory.",
   "main": "index.js",
   "scripts": {
     "test": "node test/run-tests.js",
@@ -14,7 +14,10 @@
     "deepai",
     "postgres",
     "chatbot",
-    "alexa"
+    "alexa",
+    "memory",
+    "lid",
+    "vision"
   ],
   "author": "Hansaka",
   "license": "ISC",

@@ -42,6 +42,38 @@ CREATE INDEX IF NOT EXISTS idx_wa_users_phone      ON wa_users (phone) WHERE pho
 CREATE INDEX IF NOT EXISTS idx_wa_users_last_seen  ON wa_users (last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_wa_users_local      ON wa_users (jid_local);
 
+-- ----------------------------------------------------- user identities ------
+-- WhatsApp hands the SAME human different jids depending on where they write:
+--   DM      : 94771234567@s.whatsapp.net   (phone number jid)
+--   Group   : 78151912841263@lid           (privacy / LID jid)
+-- Without a mapping the bot creates two rows and "forgets" the user the moment
+-- they speak in a group. Every jid a person is ever seen under is recorded
+-- here and points at ONE wa_users row, so memories follow the human, not the
+-- address they happen to be using.
+CREATE TABLE IF NOT EXISTS wa_user_identities (
+    id              BIGSERIAL PRIMARY KEY,
+    user_id         BIGINT      NOT NULL REFERENCES wa_users(id) ON DELETE CASCADE,
+    jid             TEXT        NOT NULL UNIQUE,            -- 78151912841263@lid
+    jid_local       TEXT        NOT NULL,
+    jid_server      TEXT        NOT NULL,
+    jid_type        TEXT        NOT NULL DEFAULT 'user',    -- lid | user
+    phone           TEXT,                                   -- NULL for @lid
+    is_primary      BOOLEAN     NOT NULL DEFAULT FALSE,
+    source          TEXT,                                   -- how the link was learned
+    first_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_wa_identities_user  ON wa_user_identities (user_id);
+CREATE INDEX IF NOT EXISTS idx_wa_identities_phone ON wa_user_identities (phone) WHERE phone IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_wa_identities_local ON wa_user_identities (jid_local);
+
+-- Backfill: every existing user is their own primary identity.
+INSERT INTO wa_user_identities (user_id, jid, jid_local, jid_server, jid_type, phone, is_primary, source)
+SELECT u.id, u.jid, u.jid_local, u.jid_server, u.jid_type, u.phone, TRUE, 'backfill'
+  FROM wa_users u
+ WHERE NOT EXISTS (SELECT 1 FROM wa_user_identities i WHERE i.jid = u.jid);
+
 -- --------------------------------------------------------------- groups -----
 CREATE TABLE IF NOT EXISTS wa_groups (
     id              BIGSERIAL PRIMARY KEY,
