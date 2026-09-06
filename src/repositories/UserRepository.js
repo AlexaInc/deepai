@@ -182,12 +182,29 @@ class UserRepository {
         );
     }
 
+    /**
+     * Block/unblock by ANY address the person is known under.
+     *
+     * Previously this matched `wa_users.jid` only, so blocking someone by the
+     * `@lid` seen in a group silently did nothing (returned null) when their
+     * row had been created from a DM phone jid — and vice versa. It now walks
+     * the alias graph, and when blocking someone the bot has never seen it
+     * creates the row so the block is already in force on their first message.
+     */
     async setBlocked(rawJid, blocked = true) {
-        const jid = JidParser.normalize(rawJid);
-        return this.db.one(
-            'UPDATE wa_users SET is_blocked = $2 WHERE jid = $1 RETURNING *',
-            [jid, Boolean(blocked)]
-        );
+        const parsed = JidParser.parse(rawJid);
+        if (!parsed.valid || parsed.isGroup) {
+            throw new ValidationError(`Invalid user jid: ${JSON.stringify(rawJid)}`);
+        }
+        let user = await this.findByJid(parsed.jid);
+        if (!user) {
+            if (!blocked) return null; // nothing to unblock
+            user = await this.upsertUser(parsed.jid);
+        }
+        return this.db.one('UPDATE wa_users SET is_blocked = $2 WHERE id = $1 RETURNING *', [
+            user.id,
+            Boolean(blocked),
+        ]);
     }
 
     async isBlocked(rawJid) {
@@ -195,12 +212,21 @@ class UserRepository {
         return Boolean(user?.is_blocked);
     }
 
+    /**
+     * Enable/disable the AI in a group. Creates the group row when the bot
+     * has not seen the group yet (an admin usually disables Alexa *before*
+     * she has answered there), instead of returning null and doing nothing.
+     */
     async setGroupEnabled(rawJid, enabled = true) {
-        const jid = JidParser.normalize(rawJid);
-        return this.db.one(
-            'UPDATE wa_groups SET is_enabled = $2 WHERE jid = $1 RETURNING *',
-            [jid, Boolean(enabled)]
-        );
+        const parsed = JidParser.parse(rawJid);
+        if (!parsed.valid || !parsed.isGroup) {
+            throw new ValidationError(`Invalid group jid: ${JSON.stringify(rawJid)}`);
+        }
+        const group = (await this.findGroupByJid(parsed.jid)) || (await this.upsertGroup(parsed.jid));
+        return this.db.one('UPDATE wa_groups SET is_enabled = $2 WHERE id = $1 RETURNING *', [
+            group.id,
+            Boolean(enabled),
+        ]);
     }
 
     /** Name Alexa should use: learned name > WhatsApp push name > fallback. */

@@ -1,12 +1,13 @@
 {
   "name": "alexa-ai",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Object-oriented DeepAI-powered AI engine for the Alexa WhatsApp bot: full DeepAI API surface, cross-chat identity linking (@lid <-> phone) and PostgreSQL-backed long-term memory.",
   "main": "index.js",
   "scripts": {
-    "test": "node test/run-tests.js",
+    "test": "node test/run-tests.js && node test/wrapper-methods.js",
     "demo": "node examples/demo.js",
-    "migrate": "node -e \"require('./index').AlexaAI.migrate(process.env.POSTGRES_URL).then(()=>{console.log('migrated');process.exit(0)}).catch(e=>{console.error(e);process.exit(1)})\""
+    "migrate": "node -e \"require('./index').AlexaAI.migrate(process.env.POSTGRES_URL).then(()=>{console.log('migrated');process.exit(0)}).catch(e=>{console.error(e);process.exit(1)})\"",
+    "test:wrapper": "node test/wrapper-methods.js"
   },
   "keywords": [
     "whatsapp",
@@ -26,5 +27,11 @@
   },
   "dependencies": {
     "pg": "^8.13.1"
-  }
+  },
+  "files": [
+    "index.js",
+    "src/",
+    "examples/",
+    "README.md"
+  ]
 }

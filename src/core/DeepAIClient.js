@@ -539,28 +539,37 @@ class DeepAIClient {
         for (const [key, value] of Object.entries(fields)) {
             if (value == null) continue;
             if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
-                form.append(key, new Blob([value]), options.filename || `${key}.bin`);
-            } else if (typeof value === 'object' && value.buffer) {
-                form.append(
-                    key,
-                    new Blob([value.buffer], { type: value.mimetype || 'application/octet-stream' }),
-                    value.filename || `${key}.bin`
-                );
+                const mimetype = options.mimetype || DeepAIClient._sniffMime(value) || 'application/octet-stream';
+                form.append(key, new Blob([value], { type: mimetype }), options.filename || `${key}.${DeepAIClient._ext(mimetype)}`);
+            } else if (typeof value === 'object' && (value.buffer || value.url)) {
+                if (value.url && !value.buffer) {
+                    form.append(key, String(value.url));
+                    continue;
+                }
+                const bytes = Buffer.isBuffer(value.buffer) ? value.buffer : Buffer.from(value.buffer);
+                const mimetype = value.mimetype || DeepAIClient._sniffMime(bytes) || 'application/octet-stream';
+                form.append(key, new Blob([bytes], { type: mimetype }), value.filename || `${key}.${DeepAIClient._ext(mimetype)}`);
+            } else if (typeof value === 'object') {
+                form.append(key, JSON.stringify(value));
             } else {
                 form.append(key, String(value));
             }
         }
         const url = `${this.config.url('api')}/${String(name).replace(/^\/+/, '')}`;
         const data = await this._json(url, { method: 'POST', body: form, signal: options.signal });
+        // The classic API reports failures as `{ err: "..." }` or `{ status: "..." }` with HTTP 200.
         if (data?.err) {
-            throw DeepAIClient._toError(200, JSON.stringify(data), data.err);
+            throw DeepAIClient._toError(200, JSON.stringify(data), String(data.err));
+        }
+        if (typeof data?.status === 'string' && !data.output_url && !data.output && !data.id) {
+            throw DeepAIClient._toError(200, JSON.stringify(data), data.status);
         }
         return data;
     }
 
     /** Text-to-image (`/api/text2img`). Returns `{ id, output_url }`. */
-    async text2img(text, extra = {}) {
-        return this.runApi(this.config.imageModel || STANDARD_APIS.text2img, { text, ...extra });
+    async text2img(text, extra = {}, options = {}) {
+        return this.runApi(this.config.imageModel || STANDARD_APIS.text2img, { text, ...extra }, options);
     }
 
     /** Prompt-driven image edit (`/api/image-editor`). */
@@ -702,7 +711,26 @@ class DeepAIClient {
     }
 
     static _isRefusal(status) {
-        return /exceeded|paid|credits|api-key|login|not allowed|forbidden/i.test(status);
+        return /exceeded|paid|credits|api-key|api key|login|not allowed|forbidden|unauthori[sz]ed/i.test(status);
+    }
+
+    /** @private magic-number sniff so uploads carry a real content type. */
+    static _sniffMime(b) {
+        if (!b || b.length < 4) return null;
+        if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return 'image/png';
+        if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return 'image/jpeg';
+        if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return 'image/gif';
+        if (b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46) return 'application/pdf';
+        if (b.length >= 12 && b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) {
+            return 'image/webp';
+        }
+        return null;
+    }
+
+    /** @private file extension for a mimetype. */
+    static _ext(mimetype) {
+        const map = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'application/pdf': 'pdf', 'text/plain': 'txt' };
+        return map[mimetype] || 'bin';
     }
 
     /** @private */

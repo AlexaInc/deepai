@@ -1,5 +1,7 @@
 'use strict';
 
+const Media = require('../utils/Media');
+
 /**
  * ImageDescriber
  * --------------
@@ -57,14 +59,20 @@ class ImageDescriber {
      *   reason:string|null, attachmentUuids:string[]
      * }>}
      */
-    async describe(image, caption = '') {
-        if (!image || (!image.buffer && !image.url && !image.base64 && !image.data)) {
-            return ImageDescriber._fail('no_image');
-        }
+    async describe(input, caption = '') {
+        // Accept a bare Buffer / base64 / data URI / URL as well as the
+        // { buffer | url } object shape — see utils/Media.
+        const image = Media.normalize(input);
+        if (!image) return ImageDescriber._fail('no_image');
 
         // Make sure we have bytes; OCR needs them and so does the upload.
         const buffer = await this._resolveBuffer(image);
         if (!buffer) return ImageDescriber._fail('unreadable');
+
+        // A URL input has no mimetype until we have the bytes.
+        if (!image.mimetype || image.mimetype === 'application/octet-stream') {
+            image.mimetype = Media.sniff(buffer) || 'image/jpeg';
+        }
 
         const isDocument = ImageDescriber._isDocument(image);
 
@@ -185,13 +193,7 @@ class ImageDescriber {
 
     /** @private Is this a text-bearing document rather than an image? */
     static _isDocument(image) {
-        const mime = String(image.mimetype || '').toLowerCase();
-        const name = String(image.filename || '').toLowerCase();
-        if (mime.startsWith('image/')) return false;
-        return (
-            /^(text\/|application\/(pdf|json|xml|rtf|msword|vnd\.))/.test(mime) ||
-            /\.(txt|pdf|docx?|csv|md|json|xml|rtf|pptx?|xlsx?|log)$/.test(name)
-        );
+        return Media.isDocument(image);
     }
 
     /** @private OCR text extraction. */
@@ -288,6 +290,11 @@ class ImageDescriber {
 
     static _fail(reason) {
         return { ok: false, description: null, source: null, reason, attachmentUuids: [] };
+    }
+
+    /** Public alias of the failure shape (used by `AlexaAI.describeImage`). */
+    static fallbackResult(reason) {
+        return ImageDescriber._fail(reason);
     }
 
     /** @private Model said it cannot see the image. */

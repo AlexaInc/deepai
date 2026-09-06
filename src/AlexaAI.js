@@ -16,8 +16,11 @@ const AmnesiaGuard = require('./services/AmnesiaGuard');
 const IdentityResolver = require('./services/IdentityResolver');
 const TriggerDetector = require('./services/TriggerDetector');
 const ImageDescriber = require('./services/ImageDescriber');
+const StreamParser = require('./core/StreamParser');
 const JidParser = require('./utils/JidParser');
+const Media = require('./utils/Media');
 const { ValidationError, QuotaExceededError, AlexaAIError } = require('./core/errors');
+const { version: PACKAGE_VERSION } = require('../package.json');
 
 /**
  * AlexaAI
@@ -78,6 +81,30 @@ class AlexaAI {
 
         this.log = this.config.logger;
         this._trimCounter = 0;
+    }
+
+    /** Package version, so a host bot can assert it loaded the build it expects. */
+    static get version() {
+        return PACKAGE_VERSION;
+    }
+
+    get version() {
+        return PACKAGE_VERSION;
+    }
+
+    /**
+     * Names of every public method on the engine. Handy for a startup
+     * self-check in the host bot:
+     *
+     *   for (const m of ['generateImage', 'searchWeb']) {
+     *       if (!AlexaAI.methods().includes(m)) throw new Error(`alexa-ai too old: missing ${m}`);
+     *   }
+     */
+    static methods() {
+        return Object.getOwnPropertyNames(AlexaAI.prototype)
+            .filter((name) => name !== 'constructor' && !name.startsWith('_'))
+            .filter((name) => typeof AlexaAI.prototype[name] === 'function')
+            .sort();
     }
 
     // =====================================================================
@@ -481,17 +508,17 @@ class AlexaAI {
             let text = message;
             let image;
 
-            // Support the { text, files:[...] } shape used by callai.js.
+            // Support the { text, files:[...] } shape used by callai.js. The
+            // file may be a Buffer, base64, data URI, URL or { buffer | url }.
             if (message && typeof message === 'object') {
-                text = message.text || '';
-                const file = Array.isArray(message.files) ? message.files[0] : null;
-                if (file) {
-                    image = Buffer.isBuffer(file)
-                        ? { buffer: file }
-                        : typeof file === 'string'
-                          ? { url: file }
-                          : file;
-                }
+                text = message.text || message.body || message.caption || '';
+                const file =
+                    (Array.isArray(message.files) ? message.files.find(Boolean) : null) ||
+                    message.image ||
+                    message.file ||
+                    message.base64 ||
+                    null;
+                image = Media.normalize(file) || undefined;
             }
 
             const result = await this.chat({
@@ -564,72 +591,220 @@ class AlexaAI {
     // =====================================================================
 
     /**
-     * Text-to-image (`POST /api/text2img`).
+     * Text-to-image.
+     *
+     * Two routes, tried in order:
+     *
+     *   1. `POST /api/text2img` — the classic public API. Fast and returns a
+     *      plain `output_url`, but it is a PAID endpoint: anonymous `tryit-…`
+     *      keys get `{"status": "Out of API credits"}` / "try it exceeded".
+     *   2. The in-chat image tool — the same `generate_image` function call the
+     *      deepai.org web client sends when you press "Create image". This
+     *      works on free chat keys and answers with a `generated_image` packet
+     *      carrying a `share_url`.
+     *
+     * Either way the result is normalised to `{ ok, url, id, error, via }`.
+     * Every failure is returned, never thrown, so a bot command can simply
+     * check `result.ok`.
+     *
      * @param {string} prompt
-     * @param {object} [opts] extra DeepAI fields (width, height, image_generator_version…)
-     * @returns {Promise<{ok:boolean, url:string|null, id:string|null, error:string|null}>}
+     * @param {object} [opts]
+     * @param {string} [opts.aspectRatio='1:1']   in-chat tool only ('1:1', '16:9', '9:16'…)
+     * @param {number} [opts.width] / [opts.height]  /api/text2img only
+     * @param {string} [opts.image_generator_version]  /api/text2img only
+     * @param {boolean} [opts.chatToolOnly]     skip /api/text2img
+     * @param {boolean} [opts.apiOnly]          skip the in-chat tool
+     * @param {AbortSignal} [opts.signal]
+     * @returns {Promise<{ok:boolean, url:string|null, id:string|null, error:string|null, message?:string, via:string|null, raw?:any}>}
      */
     async generateImage(prompt, opts = {}) {
-        try {
-            const data = await this.client.text2img(String(prompt ?? '').trim(), opts);
-            return { ok: true, url: data.output_url || null, id: data.id || null, error: null, raw: data };
-        } catch (err) {
-            this.log.warn?.(`[AlexaAI] generateImage failed: ${err.message}`);
-            return { ok: false, url: null, id: null, error: err.code || 'IMAGE_FAILED' };
+        const text = String(prompt ?? '').trim();
+        if (!text) {
+            return { ok: false, url: null, id: null, error: 'VALIDATION_ERROR', message: 'generateImage(): prompt is required', via: null };
         }
+        const { aspectRatio, chatToolOnly, apiOnly, signal, ...apiFields } = opts || {};
+        const errors = [];
+
+        // ---- 1. classic /api/text2img -------------------------------------
+        if (!chatToolOnly) {
+            try {
+                const data = await this.client.text2img(text, apiFields, { signal });
+                const url = AlexaAI._outputUrl(data);
+                if (url) return { ok: true, url, id: data.id || null, error: null, via: 'api', raw: data };
+                errors.push('text2img: no output_url in response');
+            } catch (err) {
+                errors.push(`text2img: ${err.message}`);
+                if (err.code === 'ABORTED') {
+                    return { ok: false, url: null, id: null, error: 'ABORTED', message: err.message, via: null };
+                }
+            }
+        }
+
+        // ---- 2. the chat image tool (works on free chat keys) ---------------
+        if (!apiOnly) {
+            try {
+                const answer = await this.client.chatDetailed(
+                    [{ role: 'user', content: StreamParser.imageToolPayload(text, aspectRatio || '1:1') }],
+                    { signal, extraFields: { image_generation: 'true' } }
+                );
+                const url = answer.images?.[0] || AlexaAI._outputUrl(answer.payload);
+                if (url) {
+                    return { ok: true, url, id: answer.payload?.id || null, error: null, via: 'chat', raw: answer.payload };
+                }
+                errors.push(`chat tool: no image in reply (${String(answer.text || '').slice(0, 80)})`);
+            } catch (err) {
+                errors.push(`chat tool: ${err.message}`);
+            }
+        }
+
+        const message = errors.join(' | ');
+        this.log.warn?.(`[AlexaAI] generateImage failed: ${message}`);
+        return {
+            ok: false,
+            url: null,
+            id: null,
+            error: /credits|exceeded|paid|api-key|api key/i.test(message) ? 'DEEPAI_QUOTA_EXCEEDED' : 'IMAGE_FAILED',
+            message,
+            via: null,
+        };
     }
 
-    /** Prompt-driven image edit (`POST /api/image-editor`). */
+    /**
+     * Prompt-driven image edit (`POST /api/image-editor`).
+     * `image` may be a Buffer, base64, data URI, URL or `{ buffer | url }`.
+     */
     async editImage(image, prompt, opts = {}) {
+        const field = Media.toApiField(image);
+        if (!field) return AlexaAI._mediaError('editImage', 'IMAGE_EDIT_FAILED');
         try {
-            const data = await this.client.editImage(AlexaAI._imageField(image), String(prompt ?? ''), opts);
-            return { ok: true, url: data.output_url || null, id: data.id || null, error: null, raw: data };
+            const data = await this.client.editImage(field, String(prompt ?? ''), opts);
+            return { ok: true, url: AlexaAI._outputUrl(data), id: data.id || null, error: null, raw: data };
         } catch (err) {
-            return { ok: false, url: null, id: null, error: err.code || 'IMAGE_EDIT_FAILED' };
+            return { ok: false, url: null, id: null, error: err.code || 'IMAGE_EDIT_FAILED', message: err.message };
         }
     }
 
-    /** 4x upscale (`POST /api/torch-srgan`). */
+    /** 4x upscale (`POST /api/torch-srgan`). Same input shapes as `editImage`. */
     async upscaleImage(image, opts = {}) {
+        const field = Media.toApiField(image);
+        if (!field) return AlexaAI._mediaError('upscaleImage', 'UPSCALE_FAILED');
         try {
-            const data = await this.client.upscaleImage(AlexaAI._imageField(image), opts);
-            return { ok: true, url: data.output_url || null, error: null, raw: data };
+            const data = await this.client.upscaleImage(field, opts);
+            return { ok: true, url: AlexaAI._outputUrl(data), id: data.id || null, error: null, raw: data };
         } catch (err) {
-            return { ok: false, url: null, error: err.code || 'UPSCALE_FAILED' };
+            return { ok: false, url: null, id: null, error: err.code || 'UPSCALE_FAILED', message: err.message };
         }
     }
 
-    /** NSFW score for moderation (`POST /api/nsfw-detector`). */
-    async detectNsfw(image) {
+    /** Colourise a black-and-white photo (`POST /api/colorizer`). */
+    async colorizeImage(image, opts = {}) {
+        const field = Media.toApiField(image);
+        if (!field) return AlexaAI._mediaError('colorizeImage', 'COLORIZE_FAILED');
         try {
-            const data = await this.client.detectNsfw(AlexaAI._imageField(image));
-            return { ok: true, score: data?.output?.nsfw_score ?? null, raw: data };
+            const data = await this.client.colorizeImage(field, opts);
+            return { ok: true, url: AlexaAI._outputUrl(data), id: data.id || null, error: null, raw: data };
         } catch (err) {
-            return { ok: false, score: null, error: err.code || 'NSFW_FAILED' };
-        }
-    }
-
-    /** Read an image/document without going through the conversation. */
-    async describeImage(image, caption = '') {
-        return this.vision.describe(image, caption);
-    }
-
-    /** Abstractive summary (`POST /api/summarization`). */
-    async summarizeText(text) {
-        try {
-            const data = await this.client.summarize(String(text ?? ''));
-            return { ok: true, text: data.output || '', raw: data };
-        } catch (err) {
-            return { ok: false, text: '', error: err.code || 'SUMMARY_FAILED' };
+            return { ok: false, url: null, id: null, error: err.code || 'COLORIZE_FAILED', message: err.message };
         }
     }
 
     /**
-     * One-off, stateless question to DeepAI with web search enabled — handy for
-     * "search the web for X" commands that should not touch a user's memory.
+     * NSFW score for moderation (`POST /api/nsfw-detector`).
+     * @returns {Promise<{ok:boolean, score:number|null, nsfw:boolean|null, error?:string}>}
+     */
+    async detectNsfw(image, opts = {}) {
+        const field = Media.toApiField(image);
+        if (!field) return { ...AlexaAI._mediaError('detectNsfw', 'NSFW_FAILED'), score: null, nsfw: null };
+        const threshold = typeof opts.threshold === 'number' ? opts.threshold : 0.7;
+        try {
+            const data = await this.client.detectNsfw(field);
+            const score = typeof data?.output?.nsfw_score === 'number' ? data.output.nsfw_score : null;
+            return { ok: true, score, nsfw: score == null ? null : score >= threshold, error: null, raw: data };
+        } catch (err) {
+            return { ok: false, score: null, nsfw: null, error: err.code || 'NSFW_FAILED', message: err.message };
+        }
+    }
+
+    /**
+     * Read an image/document without going through the conversation.
+     * Accepts every shape `chat({ image })` accepts, including a bare Buffer.
+     */
+    async describeImage(image, caption = '') {
+        const media = Media.normalize(image);
+        if (!media) return { ...ImageDescriber.fallbackResult('no_image'), text: '' };
+        const described = await this.vision.describe(media, String(caption ?? ''));
+        // `text` is the WhatsApp-ready answer either way (description or a
+        // polite "I can't see it" fallback), so a command can just send it.
+        return {
+            ...described,
+            text: described.ok ? ResponseFormatter.format(described.description) : ImageDescriber.fallbackMessage(caption),
+        };
+    }
+
+    /**
+     * Abstractive summary. Tries `POST /api/summarization` first (paid on
+     * most keys) and falls back to a stateless chat request, so the call
+     * works on free keys too.
+     */
+    async summarizeText(text, opts = {}) {
+        const input = String(text ?? '').trim();
+        if (!input) return { ok: false, text: '', error: 'VALIDATION_ERROR', message: 'summarizeText(): text is required' };
+        const errors = [];
+        try {
+            const data = await this.client.summarize(input);
+            const summary = String(data?.output || '').trim();
+            if (summary) return { ok: true, text: summary, via: 'api', raw: data };
+            errors.push('summarization: empty output');
+        } catch (err) {
+            errors.push(`summarization: ${err.message}`);
+        }
+        try {
+            const answer = await this.client.chatDetailed(
+                [
+                    {
+                        role: 'user',
+                        content:
+                            'Summarise the following text clearly and concisely in a few short bullet points. ' +
+                            'Use WhatsApp formatting only (*bold*, _italic_), no markdown headers.\n\n' +
+                            input.slice(0, this.config.maxMessageLength),
+                    },
+                ],
+                { model: opts.model, signal: opts.signal }
+            );
+            const summary = ResponseFormatter.format(MemoryExtractor.strip(answer.text));
+            if (summary) return { ok: true, text: summary, via: 'chat' };
+            errors.push('chat: empty reply');
+        } catch (err) {
+            errors.push(`chat: ${err.message}`);
+        }
+        return { ok: false, text: '', error: 'SUMMARY_FAILED', message: errors.join(' | ') };
+    }
+
+    /**
+     * One-off, stateless question to DeepAI with web search enabled — for
+     * "search the web for X" commands that must not touch anyone's memory.
+     *
+     * The persona still applies (WhatsApp formatting, no vendor names), but
+     * the identity/memory guards run without a user context, so this is safe
+     * to call with no jid at all.
+     *
+     * @param {string} query
+     * @param {object} [opts] { model, signal, userName }
+     * @returns {Promise<{ok:boolean, text:string, sources:Array<{title?:string,url?:string}>, error?:string, message?:string}>}
      */
     async searchWeb(query, opts = {}) {
-        const messages = this.prompts.build({ message: query, memories: {}, history: [] });
+        const question = String(query ?? '').trim();
+        if (!question) return { ok: false, text: '', sources: [], error: 'VALIDATION_ERROR', message: 'searchWeb(): query is required' };
+
+        const messages = this.prompts.build({
+            message:
+                'Search the web and answer using current information. Give a short, direct answer, ' +
+                `then list the most useful sources as "title (url)" lines.\n\nQuestion: ${question}`,
+            memories: {},
+            history: [],
+            userName: opts.userName || null,
+        });
+
         try {
             const answer = await this.client.chatDetailed(messages, {
                 search: true,
@@ -637,13 +812,24 @@ class AlexaAI {
                 model: opts.model,
                 signal: opts.signal,
             });
-            return {
-                ok: true,
-                text: ResponseFormatter.format(MemoryExtractor.strip(answer.text)),
-                sources: answer.webResults || [],
-            };
+
+            let text = ResponseFormatter.format(MemoryExtractor.strip(answer.text));
+            text = this.identityGuard.sanitise(text, false);
+            const sources = AlexaAI._sources(answer.webResults);
+
+            if (!text && sources.length) {
+                text = sources
+                    .slice(0, 5)
+                    .map((s) => `• ${s.title || s.url}${s.title && s.url ? ` (${s.url})` : ''}`)
+                    .join('\n');
+            }
+            if (!text) {
+                return { ok: false, text: '', sources, error: 'DEEPAI_EMPTY', message: 'DeepAI returned no answer' };
+            }
+            return { ok: true, text, sources, model: answer.model || null };
         } catch (err) {
-            return { ok: false, text: '', sources: [], error: err.code || 'SEARCH_FAILED' };
+            this.log.warn?.(`[AlexaAI] searchWeb failed: ${err.message}`);
+            return { ok: false, text: '', sources: [], error: err.code || 'SEARCH_FAILED', message: err.message };
         }
     }
 
@@ -654,20 +840,53 @@ class AlexaAI {
             const text = await this.client.chat([{ role: 'user', content: 'Reply with the single word: ok' }], {
                 models: [this.config.model],
             });
-            return { ok: true, latencyMs: Date.now() - started, reply: text.slice(0, 60) };
+            return { ok: true, latencyMs: Date.now() - started, reply: text.slice(0, 60), model: this.config.model };
         } catch (err) {
             return { ok: false, latencyMs: Date.now() - started, error: err.code || 'DEEPAI_ERROR', message: err.message };
         }
     }
 
-    /** @private accept a Buffer, {buffer}, or a URL string for /api/* calls. */
+    /**
+     * Legacy helper kept for callers that used it directly.
+     * Prefer `Media.toApiField()`; this now accepts the same input shapes.
+     * @deprecated
+     */
     static _imageField(image) {
-        if (!image) return null;
-        if (typeof image === 'string') return image;
-        if (Buffer.isBuffer(image) || image instanceof Uint8Array) return image;
-        if (image.buffer) return image.buffer;
-        if (image.url) return image.url;
-        return null;
+        return Media.toApiField(image);
+    }
+
+    /** @private the image url carried by an /api/* or tool response. */
+    static _outputUrl(data) {
+        if (!data || typeof data !== 'object') return null;
+        const url = data.output_url || data.share_url || data.url || (Array.isArray(data.output) ? data.output[0] : null);
+        return typeof url === 'string' && url ? url : null;
+    }
+
+    /** @private consistent error for an unusable media argument. */
+    static _mediaError(method, code) {
+        return {
+            ok: false,
+            url: null,
+            id: null,
+            error: code,
+            message: `${method}(): pass a Buffer, base64 string, data URI, URL or { buffer | url } object`,
+        };
+    }
+
+    /** @private normalise DeepAI's web-result payload to {title, url, description}. */
+    static _sources(webResults) {
+        if (!Array.isArray(webResults)) return [];
+        return webResults
+            .map((r) => {
+                if (typeof r === 'string') return { title: null, url: r, description: null };
+                if (!r || typeof r !== 'object') return null;
+                return {
+                    title: r.title || r.name || null,
+                    url: r.url || r.link || r.href || null,
+                    description: r.description || r.snippet || r.content || null,
+                };
+            })
+            .filter((r) => r && (r.url || r.title));
     }
 
     // =====================================================================
@@ -722,16 +941,39 @@ class AlexaAI {
         return { user, memories, conversations };
     }
 
+    /**
+     * Block a person from using the AI. Works with ANY address they are known
+     * under (their @lid or their phone jid) and creates the row if they have
+     * never messaged, so a pre-emptive block sticks.
+     * @returns {Promise<object>} the user row
+     */
     async blockUser(userJid) {
         return this.users.setBlocked(userJid, true);
     }
 
+    /** @returns {Promise<object|null>} the user row (null if never seen) */
     async unblockUser(userJid) {
         return this.users.setBlocked(userJid, false);
     }
 
+    /** Is this person blocked? Follows aliases like everything else. */
+    async isBlocked(userJid) {
+        return this.users.isBlocked(userJid);
+    }
+
+    /**
+     * Turn the AI on/off inside one group. Creates the group row when the bot
+     * has not seen the group yet, so the setting applies from the first message.
+     * @returns {Promise<object>} the group row
+     */
     async setGroupEnabled(groupJid, enabled = true) {
         return this.users.setGroupEnabled(groupJid, enabled);
+    }
+
+    /** Is the AI enabled in this group? (unknown groups are enabled) */
+    async isGroupEnabled(groupJid) {
+        const group = await this.users.findGroupByJid(groupJid);
+        return group ? group.is_enabled !== false : true;
     }
 
     async stats() {
@@ -744,13 +986,16 @@ class AlexaAI {
 
     /** @private */
     static _normaliseParams(params) {
+        // `image` may be a Buffer, base64, data URI, URL, or a { buffer | url }
+        // object (see utils/Media). `file` / `media` / `attachment` are aliases.
+        const rawImage = params.image ?? params.file ?? params.media ?? params.attachment ?? null;
         return {
             message: params.message == null ? '' : String(params.message).trim(),
             userId: params.userId ?? params.user ?? params.jid,
             groupId: params.groupId ?? params.group ?? null,
             userName: params.userName ?? params.pushName ?? null,
             groupName: params.groupName ?? params.subject ?? null,
-            image: params.image ?? null,
+            image: Media.normalize(rawImage),
             messageId: params.messageId ?? null,
             isAdmin: Boolean(params.isAdmin),
             signal: params.signal,

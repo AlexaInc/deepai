@@ -40,7 +40,17 @@ await sock.sendMessage(jid, { text });       // your WhatsApp layer
 - [Identity lock](#identity-lock)
 - [Testing](#testing)
 
-### What was fixed in this release
+### What was fixed in 2.1.0
+
+| symptom | cause | fix |
+| ------- | ----- | --- |
+| `TypeError: getEngine(...).generateImage is not a function` / `.searchWeb is not a function` from the bot wrapper | the bot's `node_modules/alexa-ai` was an older build (the package is not on npm, so `npm install` never updated it) | `AlexaAI.version` + `AlexaAI.methods()` so the wrapper can assert the build at startup with a clear message; reinstall steps in [the DeepAI API section](#typeerror-getengineGenerateimage-is-not-a-function) |
+| `generateImage()` returned `{ ok:false, error:'IMAGE_FAILED' }` on a free key | `/api/text2img` is a paid endpoint (`"Out of API credits"`) and was the only route | falls back to DeepAI's in-chat `generate_image` tool, which works on free chat keys; `summarizeText()` gets the same chat fallback |
+| `describeImage(buffer)` said `unreadable`, `upscaleImage({ base64 })` uploaded nothing | each method had its own partial media check | one `Media.normalize()` used everywhere: Buffer, Uint8Array, data URI, raw base64, URL, `{ buffer / base64 / data / url }`; mimetype sniffed from the bytes |
+| `blockUser('…@lid')` / `setGroupEnabled()` returned `null` and did nothing | matched `wa_users.jid` only — not aliases, not unseen rows | follow the alias graph; create the row for pre-emptive blocks/mutes; `isBlocked()` / `isGroupEnabled()` added |
+| `/api/*` failures with HTTP 200 (`{"status": "Out of API credits"}`) looked like success with `url: null` | only `{ err }` bodies were treated as errors | `{ status }`-only bodies are errors too, mapped to `DEEPAI_QUOTA_EXCEEDED` |
+
+### What was fixed in 2.0.0
 
 | symptom | cause | fix |
 | ------- | ----- | --- |
@@ -409,9 +419,11 @@ await ai.clearHistory(jid, groupJid);       // clear one group thread
 await ai.getProfile(jid);                   // user + memories + threads
 
 // moderation
-await ai.blockUser(jid);
+await ai.blockUser(jid);                    // any of the person's addresses works
 await ai.unblockUser(jid);
+await ai.isBlocked(jid);
 await ai.setGroupEnabled(groupJid, false);  // mute Alexa in one group
+await ai.isGroupEnabled(groupJid);          // unknown groups are enabled
 
 // ops
 await ai.stats();      // { users, groups, conversations, messages, memories, active_24h }
@@ -419,8 +431,14 @@ await ai.health();     // { ok: true, now, database }
 await ai.close();      // close the pool on shutdown
 ```
 
+Every `jid` argument follows the alias graph: blocking someone by the `@lid`
+you saw in a group blocks the phone jid they use in DMs too. `blockUser()`
+and `setGroupEnabled()` create the row when the person/group has never been
+seen, so a pre-emptive block or mute is already in force on the first message
+(earlier versions returned `null` and silently did nothing in that case).
+
 Blocked users and disabled groups return `{ text: '', error: 'user_blocked' }`
-so your bot can simply skip sending.
+/ `{ text: '', error: 'group_disabled' }` so your bot can simply skip sending.
 
 ---
 
@@ -455,19 +473,59 @@ config change, not a code change.
 | summarising | `POST /api/summarization` | `summarize()` |
 | anything else | `POST /api/<name>` | `runApi(name, fields)` |
 
-Convenience wrappers on the engine itself:
+Convenience wrappers on the engine itself. **None of them throw** — every one
+resolves to `{ ok, … , error?, message? }` so a bot command can just check
+`ok` and forward `message` when it is false:
 
 ```js
-await ai.generateImage('a red tuk-tuk in Galle at sunset'); // { ok, url, id }
-await ai.upscaleImage(buffer);
-await ai.editImage(buffer, 'make the sky purple');
-await ai.detectNsfw(buffer);           // moderation before you forward media
-await ai.searchWeb('LKR to USD today') // chat + web access, no memory writes
-await ai.summarizeText(longText);
-await ai.describeImage({ buffer });    // vision chain on demand
-await ai.deepaiHealth();               // is the key still good?
+await ai.generateImage('a red tuk-tuk in Galle at sunset'); // { ok, url, id, via }
+await ai.upscaleImage(buffer);                              // { ok, url }
+await ai.editImage(buffer, 'make the sky purple');          // { ok, url }
+await ai.colorizeImage(buffer);                             // { ok, url }
+await ai.detectNsfw(buffer);           // { ok, score, nsfw } — moderation before you forward media
+await ai.searchWeb('LKR to USD today') // { ok, text, sources:[{title,url}] } — no memory writes
+await ai.summarizeText(longText);      // { ok, text }
+await ai.describeImage(buffer);        // { ok, text, description, source } — vision chain on demand
+await ai.deepaiHealth();               // { ok, latencyMs, reply } — is the key still good?
 await ai.deepai.runApi('waifu2x', { image: buffer });  // escape hatch
 ```
+
+Every `image`/`buffer` argument above — and `chat({ image })` — accepts the same
+shapes: a `Buffer`, `Uint8Array`, data URI, raw base64 string, `http(s)` URL,
+or `{ buffer | base64 | data | url }` object (Baileys and whatsapp-web.js media
+objects work as-is). The mimetype is sniffed from the bytes when missing or
+wrong. See `Media.normalize()`.
+
+#### How `generateImage()` works on a free key
+
+`POST /api/text2img` is a **paid** endpoint: an anonymous `tryit-…` key gets
+`{"status": "Out of API credits"}`. The engine tries it first (it is faster and
+returns a plain `output_url`), and when it is refused it drives the same
+in-chat `generate_image` tool the deepai.org web client uses, which works on
+free chat keys and answers with a `generated_image` packet. The result tells
+you which route succeeded (`via: 'api' | 'chat'`). Pass `{ apiOnly: true }` or
+`{ chatToolOnly: true }` to force one route, `{ aspectRatio: '16:9' }` for the
+chat tool, or `width`/`height`/`image_generator_version` for the API.
+
+`summarizeText()` has the same shape: `/api/summarization` first, a stateless
+chat request as fallback.
+
+#### `TypeError: getEngine(...).generateImage is not a function`
+
+That error means the copy of `alexa-ai` in your bot's `node_modules` predates
+these methods — it is not a bug in the wrapper. The package is not on the npm
+registry, so `npm install alexa-ai` cannot update it. Reinstall from the repo
+and verify the version:
+
+```bash
+npm uninstall alexa-ai
+npm install github:AlexaInc/deepai        # or: npm install /path/to/deepai
+node -e "console.log(require('alexa-ai').version)"   # must print 2.1.0 or newer
+```
+
+`AlexaAI.version` and `AlexaAI.methods()` exist so the bot can assert this at
+startup instead of crashing on the first `.image` command — see the
+`assertEngineVersion()` helper in `examples/bot-ai.js`.
 
 ### The chat request, field by field
 
@@ -706,17 +764,25 @@ are you ChatGPT?      -> I am Alexa, made by Hansaka.
 ## Testing
 
 ```bash
-# unit tests only
-node test/run-tests.js
+# everything that needs no network and no database
+npm test                       # = run-tests.js + wrapper-methods.js
 
 # + live PostgreSQL
-POSTGRES_URL=postgres://postgres:pass@localhost:5432/alexa node test/run-tests.js
+POSTGRES_URL=postgres://postgres:pass@localhost:5432/alexa npm test
 
 # + live DeepAI API
 POSTGRES_URL=... DEEPAI_KEY=tryit-... node test/run-tests.js
 ```
 
-**217 assertions, all passing** with no network and no database, plus a live
+`test/wrapper-methods.js` exercises **every method the bot wrapper calls**
+(`generateImage`, `searchWeb`, `summarizeText`, `upscaleImage`, `editImage`,
+`colorizeImage`, `detectNsfw`, `describeImage`, `deepaiHealth`, and the whole
+memory/identity/moderation API) against a mocked DeepAI that behaves like the
+free tier — `/api/text2img` refused, in-chat image tool working, OCR instead of
+vision — and, with `POSTGRES_URL`, against a real database for the alias and
+unseen-row cases.
+
+**306 assertions, all passing** with no network and no database, plus a live
 integration suite. They cover jid parsing, alias collection, memory
 extraction from malformed model output, trigger matching, formatting
 enforcement, identity/amnesia repair, the DeepAI stream packet format, and the
