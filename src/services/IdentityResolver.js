@@ -15,8 +15,7 @@ const JidParser = require('../utils/JidParser');
  *
  * Pass any of them (`userId`, `userLid`, `userPhone`, `aliases: []`) and the
  * resolver links them together, merging previously-separate rows so the facts
- * learned in a DM are instantly available in every group — the exact bug the
- * bot owner reported.
+ * learned in a DM are instantly available in every group.
  */
 class IdentityResolver {
     /**

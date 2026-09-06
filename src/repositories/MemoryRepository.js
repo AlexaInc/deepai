@@ -7,7 +7,7 @@
  *
  * Design rule: memories are keyed to `user_id` ONLY — never to a group. That
  * is what makes Alexa recognise the same person's details in a DM and in any
- * group, exactly as required. `UNIQUE (user_id, key)` means re-learning a key
+ * group. `UNIQUE (user_id, key)` means re-learning a key
  * (e.g. the user moves city) overwrites instead of piling up duplicates.
  */
 class MemoryRepository {

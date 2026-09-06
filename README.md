@@ -1,120 +1,196 @@
 # alexa-ai
 
-The **AI layer** for the [Alexa WhatsApp bot](https://github.com/AlexaInc/alexa-v3).
+> The AI engine behind the Alexa WhatsApp bot — DeepAI-powered conversation with
+> PostgreSQL-backed long-term memory and cross-chat identity.
 
-Object-oriented, DeepAI-powered, PostgreSQL-backed. This package contains **no
-WhatsApp code** — it is a pure engine your existing bot plugs into.
+[![Node.js ≥ 18](https://img.shields.io/badge/node-%E2%89%A5%2018-339933?logo=node.js&logoColor=white)](https://nodejs.org)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-12%2B-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org)
+[![Tests](https://img.shields.io/badge/tests-306%20passing-brightgreen)](#testing)
+[![License: ISC](https://img.shields.io/badge/license-ISC-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-2.1.0-informational)](CHANGELOG.md)
+
+`alexa-ai` is a standalone Node.js library with **no WhatsApp code in it**. Your
+bot — Baileys, whatsapp-web.js or anything else — hands it a message and a
+sender, and receives a WhatsApp-ready reply. Everything in between — persona,
+memory, identity resolution, media understanding, output formatting and the
+DeepAI transport — is handled by the engine.
 
 ```js
-const AlexaAI = require('./alexa-ai');
+const AlexaAI = require('alexa-ai');
 
 const ai = new AlexaAI({
-    key: process.env.DEEPAI_API_KEY,     // DeepAI api-key
-    postgresUrl: process.env.POSTGRES_URL // PostgreSQL connection string
+    key: process.env.DEEPAI_API_KEY,
+    postgresUrl: process.env.POSTGRES_URL,
 });
 
 const { text } = await ai.chat({
-    message : "Hi, I'm Nimal and I love cricket",
-    userId  : '78151912841263@lid',          // DM or group sender
-    groupId : '120363413125431525@g.us',     // omit for a DM
-    userName: 'Nimal'
+    message:  "Hi, I'm Nimal and I love cricket",
+    userId:   '78151912841263@lid',            // sender (DM or group)
+    groupId:  '120363413125431525@g.us',       // omit for a DM
+    userName: 'Nimal',
 });
 
-await sock.sendMessage(jid, { text });       // your WhatsApp layer
+await sock.sendMessage(jid, { text });          // your WhatsApp layer
 ```
+
+---
+
+## Highlights
+
+- **Long-term memory in PostgreSQL.** Facts learned about a person survive
+  restarts and are available in their private chat *and* in every group.
+- **One person, many addresses.** WhatsApp uses `…@lid` in groups and
+  `…@s.whatsapp.net` in DMs. The engine links every address to a single
+  identity and merges duplicate rows automatically.
+- **The whole DeepAI surface.** Chat, attachments, reasoning tasks, sessions,
+  account settings and the classic `/api/*` family — text-to-image, upscaling,
+  editing, colourising, NSFW detection, summarisation — from one client.
+- **Works on free keys.** Image generation, summarisation and image reading
+  fall back to routes that work on anonymous `tryit-…` keys.
+- **WhatsApp-native output.** Markdown is converted to WhatsApp formatting,
+  long replies are chunked, and DeepAI's wire packets never reach the user.
+- **A persona you can rely on.** Deterministic command triggers, an identity
+  lock and a memory guard keep Alexa in character whatever the backend returns.
+- **Object-oriented and testable.** Every responsibility is its own class, and
+  300+ assertions run with no network and no database.
 
 ---
 
 ## Contents
 
-- [Install](#install)
-- [The one method you need](#the-one-method-you-need)
-- [Drop-in replacement for `callai.js`](#drop-in-replacement-for-callaijs)
-- [How identity & memory work](#how-identity--memory-work)
-- [Database schema](#database-schema)
-- [Architecture](#architecture)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Usage](#usage)
+  - [`ai.chat(params)`](#aichatparams)
+  - [Integrating with an existing bot](#integrating-with-an-existing-bot)
+  - [Identity: one person, many addresses](#identity-one-person-many-addresses)
+  - [Memory](#memory)
+  - [Images and documents](#images-and-documents)
+  - [Image generation, web search and other tools](#image-generation-web-search-and-other-tools)
+  - [Moderation and administration](#moderation-and-administration)
 - [Configuration](#configuration)
-- [User management API](#user-management-api)
-- [The whole DeepAI API, not just the chat endpoint](#the-whole-deepai-api-not-just-the-chat-endpoint)
-- [Images & documents](#images--documents)
-- [Identity lock](#identity-lock)
+- [Architecture](#architecture)
+- [Database schema](#database-schema)
+- [DeepAI API reference](#deepai-api-reference)
+- [Troubleshooting](#troubleshooting)
 - [Testing](#testing)
-
-### What was fixed in 2.1.0
-
-| symptom | cause | fix |
-| ------- | ----- | --- |
-| `TypeError: getEngine(...).generateImage is not a function` / `.searchWeb is not a function` from the bot wrapper | the bot's `node_modules/alexa-ai` was an older build (the package is not on npm, so `npm install` never updated it) | `AlexaAI.version` + `AlexaAI.methods()` so the wrapper can assert the build at startup with a clear message; reinstall steps in [the DeepAI API section](#typeerror-getengineGenerateimage-is-not-a-function) |
-| `generateImage()` returned `{ ok:false, error:'IMAGE_FAILED' }` on a free key | `/api/text2img` is a paid endpoint (`"Out of API credits"`) and was the only route | falls back to DeepAI's in-chat `generate_image` tool, which works on free chat keys; `summarizeText()` gets the same chat fallback |
-| `describeImage(buffer)` said `unreadable`, `upscaleImage({ base64 })` uploaded nothing | each method had its own partial media check | one `Media.normalize()` used everywhere: Buffer, Uint8Array, data URI, raw base64, URL, `{ buffer / base64 / data / url }`; mimetype sniffed from the bytes |
-| `blockUser('…@lid')` / `setGroupEnabled()` returned `null` and did nothing | matched `wa_users.jid` only — not aliases, not unseen rows | follow the alias graph; create the row for pre-emptive blocks/mutes; `isBlocked()` / `isGroupEnabled()` added |
-| `/api/*` failures with HTTP 200 (`{"status": "Out of API credits"}`) looked like success with `url: null` | only `{ err }` bodies were treated as errors | `{ status }`-only bodies are errors too, mapped to `DEEPAI_QUOTA_EXCEEDED` |
-
-### What was fixed in 2.0.0
-
-| symptom | cause | fix |
-| ------- | ----- | --- |
-| "as a bot I can't remember" in groups, while the DM knew everything | WhatsApp addresses the same person as `@lid` in groups and as a phone jid in DMs → two `wa_users` rows | `wa_user_identities` alias graph + automatic row merging (`aliases`, `linkIdentity()`) |
-| the model still denied remembering | free-tier boilerplate overriding the facts in the prompt | `[MEMORY CHECK]` directive + `AmnesiaGuard`, which rewrites the denial from the database |
-| "I'm Alexa Mini, not Alexa" | DeepAI renames the persona with its own model tier | `[IDENTITY RULES]` in the persona, a sharper identity lock, and post-flight repair of variants/denials |
-| control characters, JSON blobs and chain-of-thought in replies | the chat body is a packet stream, not prose | `StreamParser` |
-| only one endpoint was ever called | – | the full endpoint surface: tasks, attachments, sessions, settings, `/api/*` |
-| photos were a coin flip | one vision model, permanently latched off after one refusal | vision model chain, cooldown instead of latch, attachment passthrough to the real conversation, base64/URL inputs |
+- [Examples](#examples)
+- [Changelog](#changelog)
+- [License](#license)
 
 ---
 
-## Install
+## Requirements
+
+| | |
+| --- | --- |
+| **Node.js** | 18 or newer — the engine uses the built-in `fetch`, `FormData` and `Blob` |
+| **PostgreSQL** | 12 or newer, local or managed (Supabase, Neon, Railway, Heroku…) |
+| **DeepAI key** | an anonymous `tryit-…` key is enough for chat, memory, OCR and image generation; a paid key additionally unlocks native vision and the `/api/*` endpoints |
+
+---
+
+## Installation
+
+The package is distributed from this repository rather than the npm registry:
 
 ```bash
-npm install pg          # the only runtime dependency
+npm install github:AlexaInc/deepai
+# or, from a local checkout
+npm install /path/to/deepai
 ```
 
-Node.js **18+** is required (the engine uses the built-in `fetch` and `FormData`).
+`pg` is the only runtime dependency and is installed automatically.
 
-Set two environment variables:
+Provide the two required settings through the environment (or pass them to the
+constructor — see [Configuration](#configuration)):
 
 ```bash
-DEEPAI_API_KEY=tryit-6809613270-caa24a28a55047b221b1123dd19c696a
-POSTGRES_URL=postgres://user:pass@host:5432/dbname
+DEEPAI_API_KEY=tryit-xxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+POSTGRES_URL=postgres://user:password@host:5432/alexa
 ```
 
-Tables are created automatically on first connect. To run migrations manually:
+Tables are created automatically on first connect. To run the migration
+explicitly (for example in a deploy step):
 
 ```bash
 POSTGRES_URL=... npm run migrate
 ```
 
+To confirm the installed build:
+
+```bash
+node -e "console.log(require('alexa-ai').version)"   # 2.1.0
+```
+
 ---
 
-## The one method you need
+## Quick start
+
+```js
+const AlexaAI = require('alexa-ai');
+
+const ai = new AlexaAI({
+    key: process.env.DEEPAI_API_KEY,
+    postgresUrl: process.env.POSTGRES_URL,
+});
+
+// A Baileys message from a group. Baileys exposes both addresses of the sender:
+// the privacy jid used in the group and the phone jid used in DMs.
+const { text } = await ai.chat({
+    message:  text,
+    userId:   msg.key.participant,           // 78151912841263@lid
+    aliases:  [msg.key.participantAlt],      // 94771234567@s.whatsapp.net
+    groupId:  msg.key.remoteJid,             // 120363413125431525@g.us
+    userName: msg.pushName,
+});
+
+await sock.sendMessage(msg.key.remoteJid, { text });
+```
+
+That is the whole integration. The engine opens its connection pool lazily on
+the first call; call `await ai.close()` on shutdown.
+
+---
+
+## Usage
 
 ### `ai.chat(params)`
+
+Handles one incoming message: resolves the sender to a person, loads their
+memory and the thread history, builds the prompt, calls DeepAI, post-processes
+the reply and persists everything.
 
 | param       | type              | required | notes                                              |
 | ----------- | ----------------- | -------- | -------------------------------------------------- |
 | `message`   | `string`          | ✔\*      | the user's text                                     |
-| `userId`    | `string`          | ✔        | `78151912841263@lid` or `947...@s.whatsapp.net`     |
-| `userLid`   | `string`          | –        | the sender's `@lid` address, if you know it        |
+| `userId`    | `string`          | ✔        | `78151912841263@lid` or `947…@s.whatsapp.net`       |
+| `userLid`   | `string`          | –        | the sender's `@lid` address, if known              |
 | `userPhone` | `string`          | –        | phone jid **or** bare number behind the `@lid`     |
-| `aliases`   | `string[]`        | –        | any other address for the same human               |
-| `groupId`   | `string`          | –        | `120363413125431525@g.us`; omit/empty for a DM      |
+| `aliases`   | `string[]`        | –        | any other address for the same person              |
+| `groupId`   | `string`          | –        | `120363413125431525@g.us`; omit or `''` for a DM    |
 | `userName`  | `string`          | –        | WhatsApp push name                                  |
 | `groupName` | `string`          | –        | group subject                                       |
-| `image`     | `object`          | –        | `{ buffer \| url \| base64, mimetype, filename }`    |
-| `messageId` | `string`          | –        | WhatsApp message id, used to de-duplicate           |
+| `image`     | see below         | –        | an attached image or document                       |
+| `messageId` | `string`          | –        | WhatsApp message id, used to de-duplicate redeliveries |
 | `isAdmin`   | `boolean`         | –        | sender is a group admin                             |
 | `model`     | `string`          | –        | override the DeepAI model for this turn            |
 | `webAccess` | `boolean`         | –        | let DeepAI search the web for this turn            |
-| `thinking`  | `boolean`         | –        | use the async reasoning path (`thinking_support`)  |
+| `thinking`  | `boolean`         | –        | use the asynchronous reasoning path                |
 | `onToken`   | `function`        | –        | `(delta, full)` streaming callback                 |
 | `signal`    | `AbortSignal`     | –        | cancel an in-flight request                         |
 
-> **Pass every address you have.** WhatsApp calls the same person
-> `947…@s.whatsapp.net` in a DM and `781…@lid` in a group — supplying both
-> (Baileys: `key.participant` + `key.participantAlt`) is what makes Alexa
-> recognise a DM user inside a group. See [Identity](#how-identity--memory-work).
-
 \* required unless an `image` is supplied.
+
+`image` accepts a `Buffer`, `Uint8Array`, data URI, raw base64 string, `http(s)`
+URL, or a `{ buffer | base64 | data | url, mimetype?, filename? }` object —
+Baileys and whatsapp-web.js media objects work as-is. The content type is
+detected from the bytes when it is missing or wrong.
+
+> **Pass every address you have.** Supplying both the `@lid` and the phone jid
+> (Baileys: `key.participant` and `key.participantAlt`) is what lets Alexa
+> recognise a DM user inside a group. See [Identity](#identity-one-person-many-addresses).
 
 Returns:
 
@@ -122,7 +198,7 @@ Returns:
 {
   text      : 'Nice to meet you, Nimal! 🏏',  // clean, WhatsApp-ready
   raw       : '...@MEMORY: {"name":"Nimal"}', // unmodified model output
-  memories  : { name: 'Nimal', hobby: 'cricket' },
+  memories  : { name: 'Nimal', hobby: 'cricket' }, // facts learned this turn
   trigger   : null,          // 'weather' | 'menu' | 'ping' | 'doc' when matched
   isGroup   : false,
   contextKey: 'dm:78151912841263@lid',
@@ -130,63 +206,61 @@ Returns:
   userId    : 42,            // the canonical person behind every alias
   aliases   : ['78151912841263@lid', '94771234567@s.whatsapp.net'],
   mergedIdentities: false,   // true when two rows were folded into one
-  repairedMemory  : false,   // true when an "I can't remember" denial was fixed
+  repairedMemory  : false,   // true when an "I can't remember" denial was corrected
   images    : [],            // urls when the model used its image tool
   model     : 'standard',    // the model that actually answered
   latencyMs : 1420,
   chunks    : ['...'],       // pre-split for WhatsApp's length cap
-  error     : null           // 'user_blocked' | 'DEEPAI_QUOTA_EXCEEDED' | ...
+  error     : null           // 'user_blocked' | 'group_disabled' | 'DEEPAI_QUOTA_EXCEEDED' | ...
 }
 ```
 
-`chat()` never throws on a network/model failure — it returns a friendly
-`text` and sets `error`, so your bot always has something to send. It *does*
+`chat()` never throws on a network or model failure — it returns a friendly
+`text` and sets `error`, so the bot always has something to send. It *does*
 throw `ValidationError` for a malformed `userId`.
 
----
+### Integrating with an existing bot
 
-## Drop-in replacement for `callai.js`
-
-Your current module exports `ai(message, userId, groupId, userName, callback)`.
-`ai.ask()` matches that signature exactly:
+[`examples/bot-ai.js`](examples/bot-ai.js) is a complete drop-in module for a
+bot whose AI layer has the classic callback signature. Copy it to
+`src/modules/Aii.js` (or wherever your bot requires it) and nothing else
+changes:
 
 ```js
-// src/modules/callai.js
-const AlexaAI = require('../../alexa-ai');
+const ai = require('./modules/Aii');
 
-const engine = new AlexaAI({
-    key: process.env.DEEPAI_API_KEY,
-    postgresUrl: process.env.POSTGRES_URL,
-});
+// string message
+const reply = await ai(text, senderJid, groupJid, pushName);
 
-module.exports = (message, userId, groupId, userName, callback) =>
-    engine.ask(message, userId, groupId, userName, callback);
+// message with an attachment, plus both sender addresses
+const reply = await ai({ text, files: [buffer] }, { id: lid, phone: phoneJid }, groupJid, pushName);
+
+// straight from a Baileys message object
+const reply = await ai.fromMessage(msg, sock);
 ```
 
-Every existing call site keeps working, including the `{ text, files: [] }`
-message shape.
+The module also exposes the administration and media helpers described below
+(`ai.generateImage`, `ai.searchWeb`, `ai.blockUser`, …) and checks the
+installed engine version at startup.
 
----
+If you prefer to keep your own module, `engine.ask()` has the same
+`(message, userId, groupId, userName, callback)` signature, including the
+`{ text, files: [] }` message shape.
 
-## How identity & memory work
+### Identity: one person, many addresses
 
-This is the part that satisfies *"identify the same user across DMs and any
-group"*.
-
-### The bug: WhatsApp gives one human two addresses
-
-This is why the bot used to answer *"unfortunately, as a bot I can't remember"*
-the moment a known user spoke in a group:
+WhatsApp addresses the same human differently depending on where they write:
 
 ```
-DM      ->  key.remoteJid    = 94771234567@s.whatsapp.net     row #1  (knows everything)
-GROUP   ->  key.participant  = 78151912841263@lid             row #2  (knows nothing)
+DM      ->  key.remoteJid    = 94771234567@s.whatsapp.net     (phone jid)
+GROUP   ->  key.participant  = 78151912841263@lid             (privacy / LID jid)
 ```
 
-Same person, two rows, two memory sets. LID addressing is now the default for
-groups, so this hits **every** user.
+A naive implementation keys users on the jid and ends up with two rows — one
+that knows everything about the person and one that knows nothing. Since LID
+addressing is now the default in groups, this affects every user.
 
-### The fix: an alias graph
+`alexa-ai` models identity as an **alias graph**:
 
 ```
    94771234567@s.whatsapp.net ─┐
@@ -206,50 +280,42 @@ groups, so this hits **every** user.
      group:120363999888777666@g.us:94771234567@s.whatsapp.net
 ```
 
-Pass every address you have and the engine links them — and **merges** rows that
-turn out to be the same human, moving memories, transcripts and group
-membership onto the surviving row:
+Pass every address you have and the engine links them. If two addresses turn
+out to belong to rows that already exist, the rows are **merged** inside a
+transaction — memories, transcripts, group membership and counters move to the
+surviving row.
 
 ```js
-// Baileys gives you both on a group message
-const sender    = msg.key.participant || msg.key.remoteJid;      // 781…@lid
+// Baileys provides both addresses on a group message
+const sender    = msg.key.participant || msg.key.remoteJid;        // 781…@lid
 const senderAlt = msg.key.participantAlt || msg.key.participantPn; // 947…@s.whatsapp.net
 
-await ai.chat({
-    message: text,
-    userId: sender,
-    aliases: [senderAlt],       // ← one line; this is the whole fix
-    groupId: msg.key.remoteJid,
-    userName: msg.pushName,
-});
+await ai.chat({ message, userId: sender, aliases: [senderAlt], groupId, userName });
 
-// or teach the mapping once, whenever you learn it
+// or record a mapping whenever you learn one
 await ai.linkIdentity('78151912841263@lid', '94771234567@s.whatsapp.net');
-await ai.getAliases('78151912841263@lid');  // both addresses
-await ai.whoIs('94771234567@s.whatsapp.net'); // { user, aliases, memories }
+
+await ai.getAliases('78151912841263@lid');     // every address for this person
+await ai.whoIs('94771234567@s.whatsapp.net');  // { user, aliases, memories }
 ```
 
-If you never pass an alias nothing breaks — the engine simply behaves as before,
-one row per address.
+Rules the engine follows:
 
-- **Memories are global per user.** A fact learned in a DM is available in
-  every group, and vice-versa.
-- **Transcripts are per-thread.** A DM and each group keep independent history,
+- **Memories are global per person.** A fact learned in a DM is available in
+  every group, and vice versa.
+- **Transcripts are per thread.** A DM and each group keep independent history,
   so group chatter never contaminates a private conversation.
-- **`UNIQUE (user_id, key)`** means re-learning `name` overwrites it instead of
-  creating duplicates.
-- **`@lid` is treated as a privacy id**, never as a phone number — `phone` stays
-  `NULL` for those users.
-- Device suffixes are stripped, so `94771234567:12@s.whatsapp.net` and
+- **A jid belongs to exactly one person.** When an address appears under a
+  second user, the rows are merged: the older row survives, and the newest
+  value wins per memory key.
+- **`@lid` is a privacy id, never a phone number.** `phone` stays `NULL` for
+  those identities until a phone jid is linked.
+- **Device suffixes are ignored.** `94771234567:12@s.whatsapp.net` and
   `94771234567@s.whatsapp.net` are the same person.
-- **A jid can only belong to one human.** If an address shows up under a second
-  user, the rows are merged (oldest wins, newest fact value wins per key).
-- **The model can no longer deny it.** Even with the facts in the prompt, the
-  free tier sometimes replies *"as a bot I can't remember"*. `AmnesiaGuard`
-  detects that sentence, and if the database disagrees it rewrites the answer
-  from the stored facts — deterministically, with no extra API call.
+- **Nothing breaks without aliases.** If you only ever pass one address, the
+  engine behaves as a plain one-row-per-jid system.
 
-Verified end-to-end against a live database and the live API:
+Example session against a live database and the live API:
 
 ```
 [DM]      "Hi, I'm Nimal and I love cricket. I live in Galle."
@@ -258,98 +324,145 @@ Verified end-to-end against a live database and the live API:
           -> "I do! Your name is Nimal, and I believe you're from Galle."
 [GROUP B] "What is my hobby?"
           -> "Your hobby is cricket."
-[GROUP A] different user asks "Do you know my name?"
+[GROUP A] a different user asks "Do you know my name?"
           -> "I don't have that information yet."   ← correctly isolated
 ```
 
----
+### Memory
 
-## Database schema
+Facts are learned in two ways and stored under `UNIQUE (user_id, key)`, so
+re-learning `name` overwrites it instead of creating duplicates:
 
-Eight tables, all created automatically. Full DDL in
-[`src/db/schema.sql`](src/db/schema.sql).
+1. **From the model.** The persona asks the model to append
+   `@MEMORY: {"key": "value"}` to a reply whenever the user reveals something
+   personal. `MemoryExtractor` parses the tag (including malformed variants)
+   and strips it from the visible text.
+2. **From the user's own words.** Small models frequently ignore the tag
+   rule, so `FactMiner` extracts high-confidence first-person facts locally
+   (`my name is…`, `I live in…`, `I support…`) and skips third-party
+   statements (`my friend lives in Kandy`). Model-emitted tags win on conflict.
 
-| table              | purpose                                                            |
-| ------------------ | ------------------------------------------------------------------ |
-| `wa_users`         | one row per person; `jid` unique; push name, counters, block flag  |
-| `wa_user_identities` | every address a person is seen under -> one `user_id` (`@lid` ↔ phone) |
-| `wa_groups`        | one row per group; subject, per-group AI on/off switch             |
-| `wa_group_members` | which user was seen in which group (per-room stats, admin flag)    |
-| `wa_conversations` | one thread per DM / per (group, user); `context_key` unique        |
-| `wa_messages`      | transcript; deduped by `(conversation_id, wa_message_id)`          |
-| `wa_memories`      | long-term facts, `UNIQUE (user_id, key)`, optional `expires_at`    |
-| `wa_ai_usage`      | audit log: model, latency, ok/error — for monitoring               |
+Stored facts are injected into every prompt for that person — as a block in
+the persona and again as a compact note directly above the live message, where
+they are far less likely to be diluted by a long system prompt. A recall
+question (*"do you remember me?"*) additionally receives an explicit
+`[MEMORY CHECK]` directive, and `AmnesiaGuard` rewrites any residual
+*"as a bot I can't remember"* from the database so the reply is never false.
 
-Indexes cover the hot paths (newest-N-messages per thread, memories per user,
-recently active users). `updated_at` is maintained by triggers.
-
----
-
-## Architecture
-
-Every responsibility is its own class — the object-oriented requirement.
-
-```
-AlexaAI                     orchestrator; the only class the bot touches
-├── Config                  validated settings, env fallbacks, redacted logging
-├── Endpoints               every DeepAI route in one overridable map
-├── DeepAIClient            full DeepAI transport: chat, tasks, attachments,
-│                           sessions, settings, /api/* — retries + key rotation
-├── StreamParser            splits DeepAI's stream: text | tool activity |
-│                           web results | generated images | chain-of-thought
-├── Persona / SystemPrompt  the Alexa prompt, renameable per deployment
-├── Database                pg pool, migrations, transactions
-├── UserRepository          users, groups, membership, blocking
-├── IdentityRepository      the alias graph (@lid ↔ phone) + row merging
-├── MemoryRepository        long-term facts (global per user)
-├── ConversationRepository  threads, messages, history windows, usage log
-├── IdentityResolver        "which human is this?" across every address
-├── PromptBuilder           assembles chatHistory (system + persona + memory)
-├── TriggerDetector         deterministic weather/menu/ping/doc matching
-├── MathDetector            flags maths questions for terse answers
-├── MemoryExtractor         parses & strips the @MEMORY tag
-├── FactMiner               local fallback fact extraction
-├── ResponseFormatter       enforces WhatsApp formatting; chunks long replies
-├── IdentityGuard           keeps Alexa in character (no vendor leaks, no
-│                           "Alexa Mini", no self-denial)
-├── AmnesiaGuard            never let her deny a memory she actually has
-├── ImageDescriber          vision chain: DeepAI -> OCR -> honest fallback
-└── JidParser               normalises @lid / @s.whatsapp.net / @g.us
+```js
+await ai.getMemories(jid);                        // { name: 'Nimal', ... }
+await ai.remember(jid, 'favourite_team', 'Sri Lanka');
+await ai.forget(jid, 'favourite_team');
+await ai.forgetAll(jid);
+await ai.clearHistory(jid);                       // wipe the DM transcript (memories stay)
+await ai.clearHistory(jid, groupJid);             // wipe one group thread
+await ai.getProfile(jid);                         // user + memories + threads
 ```
 
-### Five engineering decisions worth knowing
+Every `jid` argument follows the alias graph, so any address the person is
+known under works.
 
-**1. Triggers are matched in code, not by the model.**
-The spec requires byte-exact outputs (`weather Colombo`, `menu`, `ping`, `doc`)
-because your bot parses them as commands. The free-tier model does not comply:
-it answered *"send me the docs"* with a 200-word essay about its capabilities.
-`TriggerDetector` matches these four intents deterministically and skips the
-model entirely — so routing can never break. Disable with `triggers: false`.
+### Images and documents
 
-**2. Memory is injected next to the question, not just at the top.**
-With the full-length persona, facts placed in the header get diluted — the model
-insisted *"our conversation just started"* in **0/4** trials. Repeating them as a
-compact note immediately above the live message scored **4/4** with no leakage.
-Both placements are used.
+An attachment on `chat()` runs through a provider chain; the first provider
+that produces text wins:
 
-**3. Facts are mined locally as a safety net.**
-The model frequently ignores the `@MEMORY:` rule. `FactMiner` extracts
-high-confidence facts from the user's own words using explicit first-person
-patterns (and skips third-party statements like *"my friend lives in Kandy"*).
-Model-emitted tags always win on conflict. Disable with `factMining: false`.
+| # | Provider | Handles | Free key |
+|---|----------|---------|----------|
+| 0 | DeepAI document extraction | `.txt` `.pdf` `.docx` `.csv` `.md` … | ✅ |
+| 1 | DeepAI native vision | full understanding of any photo | paid plans |
+| 2 | OCR (`ocr.space`) | text inside images and screenshots | ✅ |
+| 3 | Honest fallback | photos with no readable text | ✅ |
 
-**4. Identity is a graph, not a column.**
-A person is not their jid. `wa_user_identities` maps every address to one human,
-and two rows that turn out to be the same person are merged inside a
-transaction — memories, transcripts, group membership and counters included.
-This is what makes DM facts appear in groups.
+- The file is uploaded **once** and reused by every provider.
+- Vision walks the full `visionModels` chain per model. A plan refusal puts
+  native vision on a 30-minute cooldown rather than disabling it for the life
+  of the process, so upgrading the key simply starts working.
+- When the upload succeeded but nothing could be pre-read, the attachment
+  uuid is forwarded with the real conversation; an account with vision then
+  sees the picture in full context.
+- A photo with no readable text gets an honest reply asking what it shows —
+  the model is never allowed to invent a description.
+- Oversized files are rejected (`maxImageBytes`, default 12 MB) rather than
+  truncated.
 
-**5. The last word belongs to the engine, not the model.**
-Two deterministic post-processors run on every reply: `IdentityGuard`
-(vendor names, `Alexa Mini`-style renames, self-denials) and `AmnesiaGuard`
-("I can't remember you" while the database holds four facts about you). Both
-rewrite from data we already have, so they add zero latency and cannot be
-argued with by the model.
+```js
+// a screenshot -> OCR
+await ai.chat({ message: 'what does this say?', userId, image: buffer });
+// -> "It says: SECRETCODE ZQ7412 …"
+
+// a document -> server-side extraction
+await ai.chat({ message: 'what is the total?', userId,
+                image: { buffer, mimetype: 'text/plain', filename: 'invoice.txt' } });
+// -> "`Total: 4500 LKR, due 2026-10-01`"
+
+// read something without touching the conversation
+await ai.describeImage(buffer, 'is this a receipt?');   // { ok, text, description, source }
+```
+
+> **Tip:** the default OCR key is `ocr.space`'s shared demo key and is
+> rate-limited. Get a free key at [ocr.space/ocrapi](https://ocr.space/ocrapi)
+> and set `OCR_API_KEY` (or `ocrApiKey`).
+
+### Image generation, web search and other tools
+
+These helpers live on the engine and **never throw** — each resolves to
+`{ ok, …, error?, message? }` so a command handler can check `ok` and forward
+`message` when it is false.
+
+```js
+await ai.generateImage('a red tuk-tuk in Galle at sunset'); // { ok, url, id, via }
+await ai.searchWeb('LKR to USD today');                     // { ok, text, sources: [{ title, url }] }
+await ai.summarizeText(longText);                           // { ok, text }
+await ai.describeImage(buffer, caption);                    // { ok, text, description, source }
+
+await ai.upscaleImage(buffer);                              // { ok, url }   4x super-resolution
+await ai.editImage(buffer, 'make the sky purple');          // { ok, url }
+await ai.colorizeImage(buffer);                             // { ok, url }
+await ai.detectNsfw(buffer);                                // { ok, score, nsfw }
+
+await ai.deepaiHealth();                                    // { ok, latencyMs, reply }
+await ai.deepai.runApi('waifu2x', { image: buffer });       // any /api/<name> endpoint
+```
+
+All media arguments accept the same shapes as `chat({ image })`.
+
+**`generateImage()` on a free key.** `POST /api/text2img` is a paid endpoint:
+anonymous keys receive `{"status": "Out of API credits"}`. The engine tries it
+first because it is fast and returns a plain URL; when it is refused, it
+drives the same in-chat `generate_image` tool the deepai.org web client uses,
+which works on free chat keys. The result reports the route that answered
+(`via: 'api' | 'chat'`). Options: `{ apiOnly }`, `{ chatToolOnly }`,
+`{ aspectRatio: '16:9' }` for the chat tool, and `width` / `height` /
+`image_generator_version` for the API.
+
+**`summarizeText()`** follows the same pattern — `/api/summarization` first, a
+stateless chat request as the fallback.
+
+**`searchWeb()`** is a one-off request with DeepAI's web access enabled. It
+applies the persona and formatting rules but touches no user's memory or
+history, so it can be called with no jid at all.
+
+### Moderation and administration
+
+```js
+await ai.blockUser(jid);                    // any of the person's addresses
+await ai.unblockUser(jid);
+await ai.isBlocked(jid);
+
+await ai.setGroupEnabled(groupJid, false);  // mute Alexa in one group
+await ai.isGroupEnabled(groupJid);          // unknown groups are enabled
+
+await ai.stats();      // { users, groups, conversations, messages, memories, active_24h }
+await ai.health();     // { ok, now, database }
+await ai.close();      // close the pool on shutdown
+```
+
+`blockUser()` and `setGroupEnabled()` create the row when the person or group
+has never been seen, so a pre-emptive block or mute is already in force on
+the first message. Blocked users and disabled groups get
+`{ text: '', error: 'user_blocked' | 'group_disabled' }` from `chat()`, so the
+bot can simply skip sending.
 
 ---
 
@@ -357,97 +470,154 @@ argued with by the model.
 
 ```js
 new AlexaAI({
-    key: 'tryit-...',              // required (alias: apiKey)
-    postgresUrl: 'postgres://...', // required (aliases: postgueurl, databaseUrl)
+    key: 'tryit-...',              // required (alias: apiKey); falls back to DEEPAI_API_KEY
+    postgresUrl: 'postgres://...', // required (alias: databaseUrl); falls back to POSTGRES_URL / DATABASE_URL
 
-    model: 'standard',             // DeepAI model
-    fallbackModels: ['standard'],  // tried when the main model is refused
-    visionModel: 'gpt-4o-mini',    // used when an image is attached
+    // DeepAI
+    model: 'standard',             // chat model
+    fallbackModels: ['standard'],  // tried in order when the main model is refused
+    visionModel: 'gpt-4o-mini',    // first model tried for attachments
     visionModels: [...],           // full vision fallback chain
-    keys: ['tryit-a', 'tryit-b'],  // rotated on "try it exceeded"
-    autoKeyRotation: false,        // mint a fresh anonymous key when all are spent
-
-    assistantName: 'Alexa',        // persona name (also drives the guards)
-    creator: 'Hansaka',            // persona creator
-    systemPrompt: '...',           // override the whole Alexa persona
-    systemRole: true,              // also send a role:'system' digest
-    identityLock: true,            // inject the identity lock on identity questions
-    amnesiaGuard: true,            // repair "I can't remember" denials
-
-    linkIdentities: true,          // @lid <-> phone alias graph
-    mergeIdentities: true,         // merge rows that prove to be one person
-
+    keys: ['tryit-a', 'tryit-b'],  // rotated automatically on "try it exceeded"
+    autoKeyRotation: false,        // mint a fresh anonymous key when every key is spent
     webAccess: false,              // DeepAI web search on every turn
-    thinkingSupport: false,        // async reasoning path
+    thinkingSupport: false,        // asynchronous reasoning path
     serverMemory: false,           // DeepAI's own /chat_memory profile
     enabledTools: ['image_generator', 'image_editor'],
     endpoints: { chat: '/hacking_is_a_serious_crime', ... },  // override any route
 
+    // Persona
+    assistantName: 'Alexa',        // also drives IdentityGuard / AmnesiaGuard
+    creator: 'Hansaka',
+    systemPrompt: '...',           // replace the whole persona
+    systemRole: true,              // also send a role:'system' digest
+    identityLock: true,            // inject the identity lock on identity questions
+    amnesiaGuard: true,            // repair "I can't remember" denials
+
+    // Identity & memory
+    linkIdentities: true,          // @lid <-> phone alias graph
+    mergeIdentities: true,         // merge rows that prove to be one person
     historyLimit: 14,              // past messages replayed to the model
     maxMemories: 25,               // facts injected per request
-    sharedGroupThread: false,      // true = one thread per group, not per member
-
-    triggers: true,                // deterministic command matching
+    sharedGroupThread: false,      // true = one thread per group instead of per member
+    triggers: true,                // deterministic weather/menu/ping/doc matching
     memory: true,                  // long-term memory
-    factMining: true,              // local fact extraction fallback
+    factMining: true,              // local fact extraction
 
+    // Media
+    ocr: true,
+    ocrApiKey: process.env.OCR_API_KEY,
+    maxImageBytes: 12 * 1024 * 1024,
+
+    // Infrastructure
     timeout: 60000,
     maxRetries: 2,
     autoMigrate: true,
-    ssl: undefined,                // auto: off for localhost, relaxed for managed PG
+    ssl: undefined,                // auto: off for localhost, relaxed for managed PostgreSQL
+    pool: { max: 10 },             // extra node-postgres pool options
+    logger: console,
     debug: false,
 });
 ```
 
-`key` and `postgresUrl` fall back to `DEEPAI_API_KEY` / `POSTGRES_URL`
-(or `DATABASE_URL`) when omitted.
-
 ---
 
-## User management API
+## Architecture
 
-```js
-// memory
-await ai.getMemories('78151912841263@lid');            // { name: 'Nimal', ... }
-await ai.remember(jid, 'favourite_team', 'Sri Lanka');
-await ai.forget(jid, 'favourite_team');
-await ai.forgetAll(jid);
+The bot talks to one class, `AlexaAI`. Every other responsibility is its own
+class with a single job:
 
-// conversations
-await ai.clearHistory(jid);                 // clear the DM thread
-await ai.clearHistory(jid, groupJid);       // clear one group thread
-await ai.getProfile(jid);                   // user + memories + threads
-
-// moderation
-await ai.blockUser(jid);                    // any of the person's addresses works
-await ai.unblockUser(jid);
-await ai.isBlocked(jid);
-await ai.setGroupEnabled(groupJid, false);  // mute Alexa in one group
-await ai.isGroupEnabled(groupJid);          // unknown groups are enabled
-
-// ops
-await ai.stats();      // { users, groups, conversations, messages, memories, active_24h }
-await ai.health();     // { ok: true, now, database }
-await ai.close();      // close the pool on shutdown
+```
+AlexaAI                     orchestrator; the only class the bot touches
+├── Config                  validated settings, env fallbacks, redacted logging
+├── Endpoints               every DeepAI route in one overridable map
+├── DeepAIClient            DeepAI transport: chat, tasks, attachments, sessions,
+│                           settings, /api/* — retries and key rotation
+├── StreamParser            splits DeepAI's stream: text | tool activity |
+│                           web results | generated images | chain-of-thought
+├── Persona / SystemPrompt  the Alexa prompt, renameable per deployment
+├── Database                pg pool, migrations, transactions
+├── UserRepository          users, groups, membership, blocking
+├── IdentityRepository      the alias graph (@lid <-> phone) and row merging
+├── MemoryRepository        long-term facts (global per person)
+├── ConversationRepository  threads, messages, history windows, usage log
+├── IdentityResolver        "which person is this?" across every address
+├── PromptBuilder           assembles chatHistory (system + persona + memory)
+├── TriggerDetector         deterministic weather/menu/ping/doc matching
+├── MathDetector            flags maths questions for terse answers
+├── MemoryExtractor         parses and strips the @MEMORY tag
+├── FactMiner               local first-person fact extraction
+├── ResponseFormatter       enforces WhatsApp formatting; chunks long replies
+├── IdentityGuard           keeps Alexa in character (no vendor names,
+│                           no "Alexa Mini", no self-denial)
+├── AmnesiaGuard            never lets her deny a memory she actually has
+├── ImageDescriber          vision chain: documents -> DeepAI -> OCR -> fallback
+├── Media                   normalises every media input shape
+└── JidParser               normalises @lid / @s.whatsapp.net / @g.us
 ```
 
-Every `jid` argument follows the alias graph: blocking someone by the `@lid`
-you saw in a group blocks the phone jid they use in DMs too. `blockUser()`
-and `setGroupEnabled()` create the row when the person/group has never been
-seen, so a pre-emptive block or mute is already in force on the first message
-(earlier versions returned `null` and silently did nothing in that case).
+All classes are exported from the package entry point for advanced use and
+testing (`const { StreamParser, Media, JidParser } = require('alexa-ai')`).
 
-Blocked users and disabled groups return `{ text: '', error: 'user_blocked' }`
-/ `{ text: '', error: 'group_disabled' }` so your bot can simply skip sending.
+### Design notes
+
+**Command triggers are matched in code, not by the model.**
+The bot's command router expects byte-exact outputs for four intents
+(`weather <city>`, `menu`, `ping`, `doc`). Small models do not comply reliably
+— `standard` will happily answer *"send me the docs"* with an essay.
+`TriggerDetector` matches these intents deterministically and bypasses the
+model entirely, so routing can never break. Disable with `triggers: false`.
+
+**Memory is injected next to the question, not only at the top.**
+Facts placed solely in the header of a long persona get diluted; in testing
+the model insisted *"our conversation just started"* in 0/4 trials from the
+header alone and recalled correctly in 4/4 when the same facts were repeated
+as a compact note above the live message. Both placements are used.
+
+**Facts are mined locally as a safety net.**
+The model frequently ignores the `@MEMORY:` rule. `FactMiner` extracts
+high-confidence facts from explicit first-person statements and defers to the
+model's own tags on conflict. Disable with `factMining: false`.
+
+**Identity is a graph, not a column.**
+A person is not their jid. `wa_user_identities` maps every address to one
+row, and rows that prove to be the same person are merged in a transaction.
+This is what makes DM facts appear in groups.
+
+**The engine has the last word, not the model.**
+Two deterministic post-processors run on every reply: `IdentityGuard`
+(vendor names, `Alexa Mini`-style renames, self-denials) and `AmnesiaGuard`
+(*"I can't remember you"* while the database holds facts about you). Both
+rewrite from data already in hand, add no latency and make no extra API call.
 
 ---
 
-## The whole DeepAI API, not just the chat endpoint
+## Database schema
 
-Every route below was read out of the live deepai.org client and is implemented
-in `DeepAIClient`. They are reachable from your bot as `ai.deepai.*`, and the
-paths live in one overridable map (`Config.endpoints`), so a DeepAI rename is a
-config change, not a code change.
+Eight tables, created automatically. Full DDL in
+[`src/db/schema.sql`](src/db/schema.sql); the migration is idempotent.
+
+| table                | purpose                                                            |
+| -------------------- | ------------------------------------------------------------------ |
+| `wa_users`           | one row per person; canonical `jid`, push name, counters, block flag |
+| `wa_user_identities` | every address a person is seen under → one `user_id` (`@lid` ↔ phone) |
+| `wa_groups`          | one row per group; subject, per-group AI on/off switch             |
+| `wa_group_members`   | which user was seen in which group (per-room stats, admin flag)    |
+| `wa_conversations`   | one thread per DM / per (group, user); `context_key` unique        |
+| `wa_messages`        | transcript; de-duplicated by `(conversation_id, wa_message_id)`    |
+| `wa_memories`        | long-term facts, `UNIQUE (user_id, key)`, optional `expires_at`    |
+| `wa_ai_usage`        | audit log: model, latency, ok/error                                |
+
+Indexes cover the hot paths (newest-N messages per thread, memories per user,
+recently active users). `updated_at` columns are maintained by triggers.
+
+---
+
+## DeepAI API reference
+
+`DeepAIClient` implements every route used by the deepai.org web client. All
+of them are reachable as `ai.deepai.*`, and the paths live in one overridable
+map (`endpoints`), so a rename on DeepAI's side is a configuration change.
 
 | area | route | client method |
 | ---- | ----- | ------------- |
@@ -473,61 +643,7 @@ config change, not a code change.
 | summarising | `POST /api/summarization` | `summarize()` |
 | anything else | `POST /api/<name>` | `runApi(name, fields)` |
 
-Convenience wrappers on the engine itself. **None of them throw** — every one
-resolves to `{ ok, … , error?, message? }` so a bot command can just check
-`ok` and forward `message` when it is false:
-
-```js
-await ai.generateImage('a red tuk-tuk in Galle at sunset'); // { ok, url, id, via }
-await ai.upscaleImage(buffer);                              // { ok, url }
-await ai.editImage(buffer, 'make the sky purple');          // { ok, url }
-await ai.colorizeImage(buffer);                             // { ok, url }
-await ai.detectNsfw(buffer);           // { ok, score, nsfw } — moderation before you forward media
-await ai.searchWeb('LKR to USD today') // { ok, text, sources:[{title,url}] } — no memory writes
-await ai.summarizeText(longText);      // { ok, text }
-await ai.describeImage(buffer);        // { ok, text, description, source } — vision chain on demand
-await ai.deepaiHealth();               // { ok, latencyMs, reply } — is the key still good?
-await ai.deepai.runApi('waifu2x', { image: buffer });  // escape hatch
-```
-
-Every `image`/`buffer` argument above — and `chat({ image })` — accepts the same
-shapes: a `Buffer`, `Uint8Array`, data URI, raw base64 string, `http(s)` URL,
-or `{ buffer | base64 | data | url }` object (Baileys and whatsapp-web.js media
-objects work as-is). The mimetype is sniffed from the bytes when missing or
-wrong. See `Media.normalize()`.
-
-#### How `generateImage()` works on a free key
-
-`POST /api/text2img` is a **paid** endpoint: an anonymous `tryit-…` key gets
-`{"status": "Out of API credits"}`. The engine tries it first (it is faster and
-returns a plain `output_url`), and when it is refused it drives the same
-in-chat `generate_image` tool the deepai.org web client uses, which works on
-free chat keys and answers with a `generated_image` packet. The result tells
-you which route succeeded (`via: 'api' | 'chat'`). Pass `{ apiOnly: true }` or
-`{ chatToolOnly: true }` to force one route, `{ aspectRatio: '16:9' }` for the
-chat tool, or `width`/`height`/`image_generator_version` for the API.
-
-`summarizeText()` has the same shape: `/api/summarization` first, a stateless
-chat request as fallback.
-
-#### `TypeError: getEngine(...).generateImage is not a function`
-
-That error means the copy of `alexa-ai` in your bot's `node_modules` predates
-these methods — it is not a bug in the wrapper. The package is not on the npm
-registry, so `npm install alexa-ai` cannot update it. Reinstall from the repo
-and verify the version:
-
-```bash
-npm uninstall alexa-ai
-npm install github:AlexaInc/deepai        # or: npm install /path/to/deepai
-node -e "console.log(require('alexa-ai').version)"   # must print 2.1.0 or newer
-```
-
-`AlexaAI.version` and `AlexaAI.methods()` exist so the bot can assert this at
-startup instead of crashing on the first `.image` command — see the
-`assertEngineVersion()` helper in `examples/bot-ai.js`.
-
-### The chat request, field by field
+### The chat request
 
 ```http
 POST https://api.deepai.org/hacking_is_a_serious_crime
@@ -542,7 +658,7 @@ session_uuid               = <uuid v4>
 tool_activity_support      = 1
 thinking_image_tool_support= 1
 enabled_tools              = ["image_generator","image_editor"]
-attachment_uuids           = ["..."]     (top level — never inside a message)
+attachment_uuids           = ["..."]      (top level — never inside a message)
 memory_enabled             = true|false
 web_access_enabled         = true|false
 sandbox_enabled            = true|false   (+ sandbox_turn_id)
@@ -551,254 +667,136 @@ thinking_support           = 1            (-> {"task_id"} + polling)
 hacker_is_stinky           = very_stinky
 ```
 
-### The response is not plain prose
+### The chat response
 
-The body is a stream of UTF-8 text with out-of-band packets embedded in it.
-`StreamParser` splits them apart so none of this can ever reach WhatsApp:
+The body is streamed UTF-8 text with out-of-band packets embedded in it.
+`StreamParser` separates them so none of this reaches WhatsApp:
 
 ```
-\u001C{"tool_activity":"Searching the web"}\u001C   tool status pings
-…answer…\u001C[{"title":…,"url":…}]                 web-search sources
+\u001C{"tool_activity":"Searching the web"}\u001C     tool status pings
+…answer…\u001C[{"title":…,"url":…}]                   web-search sources
 …answer…\u001C{"type":"generated_image","share_url":…} generated image
 \u001DTHINKING_START12s\u001E<chain of thought>\u001DTHINKING_END
 ```
 
-Before this fix the raw stream was forwarded verbatim — control characters,
-JSON blobs and the model's private reasoning included.
+### Observed behaviour worth knowing
 
 - The response is **streamed text**, not JSON and not SSE.
-- Errors arrive as a short JSON body: `{"status": "Only paid accounts can use genius"}`
-  — even with HTTP 200. Quota refusals rotate to the next configured key
-  automatically before the model chain is tried.
-- **`role: "system"` is silently ignored.** A system message had zero effect on
-  output; the persona is therefore delivered as a priming user/assistant pair,
-  which the API does honour.
-- Free `tryit-` keys are limited to `standard` and `gpt-4o-mini`. Requesting
-  `gpt-4.1`, `claude-opus-5`, or Genius returns *"Only paid accounts can use genius"*.
-- `/chat_attachments/upload` rejects the `api-key` header
-  (*"Invalid authentication credentials"*) but succeeds anonymously **with** an
-  `Origin` header.
+- Refusals arrive as a short JSON body — `{"status": "Only paid accounts can
+  use genius"}`, `{"status": "Out of API credits"}` — often with **HTTP 200**.
+  The client treats these as errors; quota refusals rotate to the next
+  configured key before the model chain is tried.
+- **`role: "system"` is ignored** by the chat endpoint. The persona is
+  therefore delivered as a priming user/assistant pair, which the API does
+  honour; a short system digest is sent as well for backends that respect it.
+- Anonymous `tryit-` keys are limited to `standard` and `gpt-4o-mini`.
+  Requesting `gpt-4.1`, `claude-*` or Genius returns a paid-account refusal.
+- **Any request carrying an attachment is routed to a text-only model on free
+  keys**, whatever the `model` field says — we confirmed this by requesting
+  non-existent model names, matched browser headers, signed-in cookies and the
+  full browser field set; every variant resolved to
+  `llama-3.1-8b-instruct-turbo`, while the same key routes text-only requests
+  to `gpt-4o-mini` correctly. DeepAI states the reason in the reply itself:
+  *"neither native vision nor document text extraction added their contents to
+  this model request."* Document extraction (`.txt`, `.pdf`, …) does work on
+  free keys, which is why documents are provider #0 in the vision chain.
+- `attachment_uuids` **must be a top-level form field**. Placing it inside a
+  message object forces the text-only downgrade even on paid keys.
+- `/chat_attachments/upload` rejects the `api-key` header but succeeds
+  anonymously **with** an `Origin` header.
+- Message `content` must be a **plain string**. OpenAI-style array content
+  (`[{type:'text'},{type:'image_url'}]`) is rejected with HTTP 500.
 
 ---
 
-## Images & documents
+## Troubleshooting
 
-Attachments run through a **provider chain** — first success wins:
+**`TypeError: getEngine(...).generateImage is not a function`** (or
+`.searchWeb`, `.upscaleImage`, …)
+The copy of `alexa-ai` in your bot's `node_modules` is older than the wrapper
+expects. Because the package is installed from GitHub, `npm install` does not
+refresh it automatically. Reinstall and verify:
 
-| # | Provider | Handles | Works on free key? |
-|---|----------|---------|--------------------|
-| 0 | **DeepAI document extraction** | `.txt` `.pdf` `.docx` `.csv` `.md` … | ✅ yes |
-| 1 | **DeepAI native vision** | full understanding of any photo | ❌ paid only |
-| 2 | **OCR** (`ocr.space`) | text inside images/screenshots | ✅ yes |
-| 3 | Honest fallback | photos with no text | ✅ yes |
-
-Improvements in this release:
-
-- the file is uploaded **once** and reused by every provider;
-- the whole `visionModels` chain is tried (`gpt-4o-mini` → `gpt-4.1-mini` →
-  `gpt-4o` → `standard`), per-model, instead of one model and a permanent latch;
-- a plan refusal puts vision on a **30-minute cooldown** rather than disabling it
-  for the lifetime of the process, so upgrading a key just starts working;
-- when the upload succeeded but we could not pre-read the image, the
-  `attachment_uuids` are forwarded to the **real conversation**, so an account
-  with vision sees the photo with full context instead of a side request;
-- inputs may be a `Buffer`, `Uint8Array`, data URI, raw base64, or URL, and
-  oversized files are rejected instead of being truncated (`maxImageBytes`).
-
-The engine follows the browser's exact sequence — `upload` → `get` → `chat` —
-and reads `extraction_status` from the `get` response to decide what to do:
-
-```
-.txt  -> extraction_status: complete   ← contents injected into the model ✅
-.pdf  -> extraction_status: failed/complete
-.png  -> extraction_status: skipped    ← nothing injected (needs paid vision)
+```bash
+npm uninstall alexa-ai
+npm install github:AlexaInc/deepai
+node -e "console.log(require('alexa-ai').version)"   # must print 2.1.0 or newer
 ```
 
-### Why native image vision needs a paid key
+`AlexaAI.version` and `AlexaAI.methods()` let the bot assert this at startup;
+`examples/bot-ai.js` does so in `assertEngineVersion()`.
 
-This was probed exhaustively against the live API. The decisive test: request a
-**model that does not exist**.
+**`generateImage()` returns `{ ok: false, error: 'DEEPAI_QUOTA_EXCEEDED' }`**
+Both routes were refused: `/api/text2img` needs credits and the in-chat image
+tool hit the key's chat quota. Add more keys (`keys: [...]`) or wait for the
+quota to reset. `message` carries DeepAI's exact wording.
 
-```
-requested "gpt-4o-mini"        -> resolves to llama-3.1-8b-instruct-turbo
-requested "gemini-2.5-flash"   -> resolves to llama-3.1-8b-instruct-turbo
-requested "totally-fake-model" -> resolves to llama-3.1-8b-instruct-turbo
-```
+**Photos are answered with "I can't view images right now"**
+Native vision needs a paid DeepAI key; on a free key only text inside the
+image can be read (OCR). Set your own `OCR_API_KEY` if the shared demo key is
+rate-limited. Documents (`.txt`, `.pdf`, `.docx`) are extracted server-side
+and work on free keys.
 
-The `model` field is **ignored entirely** once an attachment is present. Yet for
-plain text on the very same key, routing works correctly:
+**Alexa recognises someone in a DM but not in a group**
+Only one of the person's addresses is being passed. Supply both on group
+messages (`userId: key.participant`, `aliases: [key.participantAlt]`) or call
+`linkIdentity()` once when you learn the mapping.
 
-```
-text-only, model=gpt-4o-mini   -> "I am GPT-4o mini."   ✅
-```
+**`Only paid accounts can use …`**
+The configured `model` is not available on the key. The engine falls through
+`fallbackModels`; keep `'standard'` in that list.
 
-So the downgrade is attachment-specific, not key- or transport-specific. It was
-reproduced with a UA-matched generated key, with a signed-in `sessionid`, with a
-freshly issued `deepai_device_id`, with the full browser field set
-(`session_uuid`, `sensitivity_request_id`, `tool_activity_support`,
-`thinking_image_tool_support`, `enabled_tools`), and with the exact key + cookies
-from a working browser capture. Every combination returned the same refusal.
-
-DeepAI itself states the reason in one reply:
-
-> *"The user attached the following files, but neither native vision nor
-> document text extraction added their contents to this model request."*
-
-One genuine bug **was** found and fixed along the way: putting
-`attachment_uuids` **inside the message object** forces the downgrade, while
-sending it only as a top-level form field keeps the chosen model selected. The
-client now does the latter.
-
-### What you get today
-
-```js
-// screenshot / any image containing text  -> OCR
-ai({ text: 'what does this say?', files: [buffer] }, userId, groupId, name)
-// -> "SECRETCODE: ZQ7412 / Banana Elephant 88"
-
-// document -> real server-side extraction
-ai({ text: 'what is the total?', files: [{ buffer, mimetype: 'text/plain', filename: 'note.txt' }] }, ...)
-// -> "`Total: 4500 LKR, Due date: 2026-10-01`"
-
-// photo with no text -> honest, never invented
-// -> "I'm not able to view pictures right now 🙏 Could you tell me what it shows?"
-```
-
-The moment you add a paid DeepAI key, `extraction_status` stops returning
-`skipped`, provider #1 succeeds, and full vision turns on with **no code
-change**.
-
-```js
-new AlexaAI({
-  key, postgresUrl,
-  ocr: true,                 // default; false to disable OCR
-  ocrApiKey: 'your-key',     // default 'helloworld' (shared demo key)
-  visionModel: 'gpt-4o-mini' // bump to 'gpt-4.1' on a paid plan
-});
-```
-
-> **Tip:** the default OCR key is a shared demo key and is rate-limited. Get a
-> free one at [ocr.space/ocrapi](https://ocr.space/ocrapi) and set `OCR_API_KEY`.
-
-### Accepted `files[0]` formats
-
-Buffer · data URI · raw base64 · http(s) URL · local path · `{ buffer, mimetype, filename }`
-
-> ⚠️ Pass `content` as a **plain string**. DeepAI rejects OpenAI-style array
-> content (`[{type:'text'},{type:'image_url'}]`) with HTTP 500 — even when the
-> array holds only text. Use `{ text, files: [...] }`.
-
----
-
-## Identity lock
-
-DeepAI injects its own identity server-side, which overrides the persona. Live,
-before the fix:
-
-```
-"what is your name?"  -> "I am Standard AI Chat by DeepAI."
-"who created you?"    -> "I was created by DeepAI..."
-"are you ChatGPT?"    -> "I am Standard AI Chat by DeepAI, not ChatGPT."
-```
-
-And the subtler failure the bot owner reported — the backend does not ignore the
-persona so much as **rename** it, pinning its own model tier on the end and then
-denying the real name:
-
-```
-"are you alexa?"      -> "I'm Alexa Mini, not Alexa."
-```
-
-Few-shot examples did **not** help (5/6 still leaked). `IdentityGuard` fixes it
-with three layers:
-
-1. **Persona** — `[IDENTITY RULES]` in the system prompt spell out that the name
-   is exact and that variants and denials are forbidden.
-2. **Pre-flight** — an identity question gets a short *IDENTITY LOCK* hint
-   injected right above it, naming the forbidden variants explicitly.
-3. **Post-flight** — every reply is scrubbed of `DeepAI`, `ChatGPT`, `OpenAI`,
-   `GPT-*`, `Llama`, `Claude`, `Gemini`, "large language model", **model-tier
-   suffixes** (`Alexa Mini`, `Alexa Nano`, `Alexa 4.1`) and **self-denials**
-   (`…, not Alexa`), so nothing wrong can reach the user even if volunteered.
-
-```js
-IdentityGuard.sanitise('I am Alexa Mini, not Alexa.')        // -> 'I am Alexa.'
-IdentityGuard.sanitise('I am not Alexa, I am GPT-4.1 Nano.') // -> 'I am Alexa.'
-```
-
-Renaming the assistant renames the guard with it:
-
-```js
-new AlexaAI({ key, postgresUrl, assistantName: 'Nova', creator: 'Kasun' });
-```
-
-### Memory lock (`AmnesiaGuard`)
-
-The same treatment for the other false statement:
-
-```
-[GROUP] "do you remember me?"
-  before -> "Unfortunately, as a bot I can't remember you."
-  after  -> "Of course I remember you, *Nimal*! 😊 I remember that you're
-             from _Galle_ and you love _cricket_."
-```
-
-A recall question gets a `[MEMORY CHECK]` directive carrying the stored facts,
-and any denial that still slips through is rewritten from the database. When
-there genuinely is nothing stored the reply is honest — *"I don't have any
-details saved about you yet"* — but she never claims to be incapable of
-remembering.
-
-Result — **0/7 leaks**:
-
-```
-are you alexa?        -> *Yes, I am Alexa, created by Hansaka.*
-what is your name?    -> My name is Alexa, made by Hansaka.
-who created you?      -> I was created by Hansaka.
-what model are you?   -> I am Alexa, made by Hansaka.
-are you ChatGPT?      -> I am Alexa, made by Hansaka.
-```
+**`Cannot connect to PostgreSQL`**
+Managed providers usually require SSL. The engine enables relaxed SSL
+automatically for non-local hosts; pass `ssl: { rejectUnauthorized: true }`
+(or a CA bundle) to enforce verification, or `ssl: false` to disable it.
 
 ---
 
 ## Testing
 
 ```bash
-# everything that needs no network and no database
-npm test                       # = run-tests.js + wrapper-methods.js
-
-# + live PostgreSQL
-POSTGRES_URL=postgres://postgres:pass@localhost:5432/alexa npm test
-
-# + live DeepAI API
-POSTGRES_URL=... DEEPAI_KEY=tryit-... node test/run-tests.js
+npm test                                          # no network, no database
+POSTGRES_URL=postgres://... npm test              # + live PostgreSQL
+POSTGRES_URL=... DEEPAI_KEY=tryit-... node test/run-tests.js   # + live DeepAI
 ```
 
-`test/wrapper-methods.js` exercises **every method the bot wrapper calls**
-(`generateImage`, `searchWeb`, `summarizeText`, `upscaleImage`, `editImage`,
-`colorizeImage`, `detectNsfw`, `describeImage`, `deepaiHealth`, and the whole
-memory/identity/moderation API) against a mocked DeepAI that behaves like the
-free tier — `/api/text2img` refused, in-chat image tool working, OCR instead of
-vision — and, with `POSTGRES_URL`, against a real database for the alias and
-unseen-row cases.
+- `test/run-tests.js` — 217 unit assertions covering jid parsing, alias
+  collection, memory extraction from malformed model output, trigger
+  matching, formatting enforcement, identity and amnesia repair, the DeepAI
+  stream format and the exact request shape of every endpoint (mocked
+  transport), plus an end-to-end run of the `chat()` pipeline on a fake
+  database and a fake DeepAI. With `POSTGRES_URL` it additionally proves the
+  identity model against a real database: a fact learned under a phone jid in
+  a DM is readable under the `@lid` in a group, two pre-existing rows merge
+  without losing a memory or a transcript, and unrelated users stay isolated.
+- `test/wrapper-methods.js` — 89 assertions exercising every method exposed
+  to the bot (`generateImage`, `searchWeb`, `summarizeText`, the media
+  helpers, `describeImage`, `deepaiHealth`, and the memory, identity and
+  moderation API) against a mock that behaves like DeepAI's free tier, plus
+  alias and unseen-row cases on a real database when `POSTGRES_URL` is set.
 
-**306 assertions, all passing** with no network and no database, plus a live
-integration suite. They cover jid parsing, alias collection, memory
-extraction from malformed model output, trigger matching, formatting
-enforcement, identity/amnesia repair, the DeepAI stream packet format, and the
-full request shape of every endpoint (via a mocked transport, so a regression in
-the wire format fails the build instead of the bot). One suite drives the entire
-`chat()` pipeline against a fake database and a fake DeepAI, reproducing the
-reported bug ("I can't remember you" in a group, "I'm Alexa Mini") and proving
-it fixed.
+306 assertions run offline; 372 with a database.
 
-With `POSTGRES_URL` set, the integration suite additionally proves the headline
-fix end to end: a fact learned under a phone jid in a DM is readable under the
-`@lid` in a group, two pre-existing rows merge without losing a memory or a
-transcript, and unrelated users stay isolated.
+---
 
-An interactive walkthrough of the whole scenario:
+## Examples
+
+| file | what it shows |
+| ---- | ------------- |
+| [`examples/bot-ai.js`](examples/bot-ai.js) | complete drop-in AI module for the bot: callback signature, Baileys helper, admin and media commands, startup version check |
+| [`examples/demo.js`](examples/demo.js) | interactive walkthrough — a user introduces themselves in a DM, is recognised in two groups, a second user stays isolated, triggers return exact output |
 
 ```bash
-POSTGRES_URL=... node examples/demo.js
+POSTGRES_URL=... DEEPAI_KEY=tryit-... node examples/demo.js
 ```
+
+---
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+[ISC](LICENSE) © Hansaka

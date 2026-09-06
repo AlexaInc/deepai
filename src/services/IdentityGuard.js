@@ -11,7 +11,7 @@
  * is not enough on its own. Observed live:
  *
  *   "what is your name?"    -> "I am Standard AI Chat by DeepAI."
- *   "are you alexa?"        -> "I'm Alexa Mini, not Alexa."      <-- reported bug
+ *   "are you alexa?"        -> "I'm Alexa Mini, not Alexa."      <-- observed live
  *   "who created you?"      -> "I was created by DeepAI..."
  *
  * That second one is the important one: the backend does not ignore the

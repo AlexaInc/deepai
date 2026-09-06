@@ -648,7 +648,7 @@ section('DeepAIClient — the whole endpoint surface (mocked transport)');
 
 // ==========================================================================
 //  End-to-end: the whole chat() pipeline on a fake database + fake DeepAI.
-//  This is the reported bug, reproduced and proven fixed, with no network.
+//  The cross-chat identity scenario, end to end, with no network.
 // ==========================================================================
 async function endToEndTests() {
     section('AlexaAI.chat() — end to end (fake database + fake DeepAI)');
@@ -791,7 +791,7 @@ async function integration() {
         check("user B cannot see user A's memories", Object.keys(bMap).length, 0);
 
         // --- identity: ONE human behind two WhatsApp addresses --------------
-        // This is the reported bug: a DM arrives from 947…@s.whatsapp.net and
+        // The core scenario: a DM arrives from 947…@s.whatsapp.net and
         // the same person writes in a group as 781…@lid.
         await ai.db.query('TRUNCATE wa_users, wa_groups RESTART IDENTITY CASCADE');
 

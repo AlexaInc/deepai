@@ -7,7 +7,7 @@
  *   DEEPAI_KEY=tryit-xxxxx \
  *   node examples/demo.js
  *
- * Walks through the exact scenario Hansaka described:
+ * Walks through the core scenario the engine is built for:
  *   1. user introduces themselves in a DM
  *   2. the same user is recognised in group A
  *   3. and in group B

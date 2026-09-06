@@ -5,9 +5,8 @@
  * ---------
  * Every DeepAI route the engine knows how to talk to.
  *
- * These were read straight out of the live deepai.org chat client (the page
- * source the bot owner captured from the browser "Sources" tab), so the engine
- * speaks the *whole* API instead of only POSTing to the generative endpoint:
+ * These were taken from the live deepai.org chat client, so the engine speaks
+ * the *whole* API instead of only POSTing to the generative endpoint:
  *
  *   POST /hacking_is_a_serious_crime      chat completion (streamed text)
  *   GET  /check_chat_task_status          poll a background task (thinking, memory refresh)
