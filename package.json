@@ -1,0 +1,51 @@
+{
+  "name": "alexa-ai",
+  "version": "2.1.2",
+  "description": "AI engine for the Alexa WhatsApp bot: DeepAI-powered chat with PostgreSQL-backed long-term memory, cross-chat identity (@lid <-> phone), vision/OCR, image generation and web search.",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test/run-tests.js && node test/wrapper-methods.js",
+    "demo": "node examples/demo.js",
+    "migrate": "node -e \"require('./index').AlexaAI.migrate(process.env.POSTGRES_URL).then(()=>{console.log('migrated');process.exit(0)}).catch(e=>{console.error(e);process.exit(1)})\"",
+    "test:wrapper": "node test/wrapper-methods.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AlexaInc/deepai.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AlexaInc/deepai/issues"
+  },
+  "homepage": "https://github.com/AlexaInc/deepai#readme",
+  "keywords": [
+    "whatsapp",
+    "ai",
+    "deepai",
+    "postgres",
+    "chatbot",
+    "alexa",
+    "memory",
+    "lid",
+    "baileys",
+    "vision",
+    "ocr",
+    "image-generation"
+  ],
+  "author": "Hansaka",
+  "license": "ISC",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "index.js",
+    "src/",
+    "examples/",
+    "test/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}
