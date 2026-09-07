@@ -112,6 +112,14 @@ class Config {
         ]);
         this.imageModel = opts.imageModel || 'text2img';
 
+        // ---- Anonymous device identity ---------------------------------------
+        // The deepai.org client sets a `deepai_device_id` cookie (32 random
+        // bytes, base64url) and sends it on every api.deepai.org request.
+        // Anonymous /api/* generation is rate-limited per device, so the
+        // client keeps one stable id (per instance here; pass yours in to
+        // share the browser quota, e.g. the value from DevTools → Cookies).
+        this.deviceId = opts.deviceId || process.env.DEEPAI_DEVICE_ID || null;
+
         // ---- Engine web search (searchWeb) ----------------------------------
         // The engine searches first and hands real results to the model, so
         // every URL the bot shows comes from a search, never from the model.

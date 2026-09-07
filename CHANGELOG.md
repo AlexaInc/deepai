@@ -4,6 +4,26 @@ All notable changes to `alexa-ai` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.2.1] — 2026-09-07
+
+### Added
+- **Device identity** — the deepai.org client sets a `deepai_device_id`
+  cookie (32 random bytes, base64url) and sends it on every api.deepai.org
+  request; anonymous `/api/*` generation is rate-limited per device. The
+  client now keeps a stable random id per instance (`DeepAIClient.randomDeviceId()`)
+  and sends it as a cookie; override with `deviceId` / `DEEPAI_DEVICE_ID`
+  (e.g. paste the value from DevTools → Cookies to share the browser quota).
+- `examples/text2img-standalone.js` — zero-dependency CLI that generates an
+  image with the anonymous browser dialect (fresh hash-valid single-use key,
+  browser headers, form-data), independent of the engine. Companion guide:
+  `DEEPAI-TEXT2IMG-FIX.md` documents the full Postman / Node.js recipe.
+
+### Fixed
+- README troubleshooting for "works in the browser playground but fails in
+  Postman/Node": documented the three failure modes (single-use keys,
+  UA-bound key hash, form-data + Origin requirement) with working Postman
+  and cURL recipes.
+
 ## [2.2.0] — 2026-09-07
 
 ### Fixed

@@ -854,6 +854,29 @@ error), and the reply came from DeepAI's own web access. Point
 `webSearchProvider` at a search API you control if the public endpoints are
 blocked where the bot runs.
 
+**Works in the browser playground but fails in Postman / Node.js** — three
+separate traps, all verified live:
+
+1. **The playground's key is anonymous, single-use, and User-Agent-bound.**
+   Every click mints `tryit-<digits>-<hash>` where
+   `hash = H(UA + H(UA + H(UA + digits + "hackers_become_a_little_stinkier_every_time_they_hack")))`
+   and the server recomputes it from your `User-Agent` header. Copy the key
+   from DevTools (already burned) or invent random hex → `401 "Please pass a
+   valid Api-Key"`. A fresh, correctly-hashed key must be minted **per
+   request** — `DeepAIClient.generateTryItKey(userAgent)` does it, and
+   `headers()` mints one automatically for `tryit-…` keys.
+2. **The body must be `multipart/form-data`** (never JSON), with
+   `generation_source=img` (model page) or `generation_source=chat` +
+   `width`/`height`/`image_generator_version=hd`/`quality=true` (chat page).
+   Never set `Content-Type` manually — the multipart boundary is generated.
+3. **`Origin: https://deepai.org` is required**, and anonymous generation is
+   refused from datacenter/VPN IPs (`401 "Please try this model on deepai.org"`) —
+   run from a residential IP. Passing `deviceId` (the `deepai_device_id`
+   cookie value) also helps the per-device quota.
+
+`examples/text2img-standalone.js` is a zero-dependency CLI implementing the
+full recipe; `DeepAI-TEXT2IMG-FIX.md` ships the same for Postman and cURL.
+
 **`generateImage()` returns `{ ok: false, error: 'DEEPAI_QUOTA_EXCEEDED' }`**
 `/api/text2img` is Pro-only for registered keys ("APIs are only available for
 Pro members in good standing"), the anonymous browser-shaped retry was

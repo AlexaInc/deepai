@@ -43,6 +43,10 @@ class DeepAIClient {
         this._keyIndex = 0;
         this.sessionUuid = DeepAIClient.uuid();
 
+        // Stable per-instance device id — mirrors the `deepai_device_id`
+        // cookie the site sets in the browser (see Config.deviceId).
+        this.deviceId = this.config.deviceId || DeepAIClient.randomDeviceId();
+
         if (typeof fetch !== 'function') {
             throw new DeepAIError(
                 'Global fetch() is unavailable. AlexaAI requires Node.js 18+ (or install undici).',
@@ -118,6 +122,18 @@ class DeepAIClient {
     }
 
     /**
+     * Random device id in the exact shape of the site's `deepai_device_id`
+     * cookie: 32 random bytes, base64url (43 chars) — same entropy as the
+     * server's secrets.token_urlsafe(32).
+     */
+    static randomDeviceId() {
+        const bytes = typeof crypto !== 'undefined' && crypto.getRandomValues
+            ? crypto.getRandomValues(new Uint8Array(32))
+            : Buffer.from(Array.from({ length: 32 }, () => Math.floor(Math.random() * 256)));
+        return Buffer.from(bytes).toString('base64url');
+    }
+
+    /**
      * deepai.org's hand-rolled MD5 variant, ported verbatim from the live
      * site client (generateIslandKey). Deterministic so the server can
      * recompute and verify the tryit key hash from the User-Agent header.
@@ -169,6 +185,7 @@ class DeepAIClient {
             Origin: this.config.origin,
             Referer: `${this.config.origin}/`,
             'User-Agent': this.config.userAgent,
+            ...(this.deviceId ? { Cookie: `deepai_device_id=${this.deviceId}` } : {}),
             ...extra,
         };
     }
