@@ -4,6 +4,29 @@ All notable changes to `alexa-ai` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.5.0] — 2026-09-07
+
+### Added
+- **`proxy` option / `DEEPAI_PROXY`** — route `/api/*` calls through a
+  residential or mobile proxy (`http(s)://` / `socks5://`). Honoured by the
+  curl transports (`-x`); `transport: 'auto'` drops global fetch from the
+  chain when a proxy is set. This is what makes anonymous image generation
+  work from a VPS / data-center IP.
+- **`englishOnly` (default on)** — the persona instructs English-only replies;
+  any CJK/Kana/Hangul in an answer triggers one translation re-ask and, if
+  that fails, script stripping with a plain-English fallback sentence.
+- `DEEPAI_LOGIN_REQUIRED` error for login-gated models ("model only available
+  to logged in users") — no key rotation, anonymous retry or transport
+  cascade is attempted for them.
+
+### Changed
+- **`detectNsfw()` on free keys** — `nsfw-detector` has no free/anonymous
+  tier, so after the API refusal the engine asks the vision model for a
+  safety score (`via: 'chat'`) and otherwise returns `DEEPAI_PRO_REQUIRED`
+  with an explanatory message.
+- When script stripping empties the reply, a fixed English sentence is sent
+  instead of the original non-English text.
+
 ## [2.4.0] — 2026-09-07
 
 ### Fixed

@@ -418,6 +418,26 @@ class AlexaAI {
         // Guarantee no @MEMORY remnant ever reaches WhatsApp.
         if (/@\s*MEMORY/i.test(finalText)) finalText = MemoryExtractor.strip(finalText);
 
+        // English-only replies: if the model answered in another script,
+        // re-ask once for an English version and strip any remainder.
+        if (this.config.englishOnly && ResponseFormatter.hasNonEnglish(finalText)) {
+            let repaired = null;
+            try {
+                repaired = await this.client.chat([
+                    { role: 'user', content: `Rewrite the following in plain English only, keeping the same meaning and formatting. Output only the English text and nothing else:\n\n${finalText}` },
+                ]);
+            } catch {
+                repaired = null;
+            }
+            if (repaired && repaired.trim() && !ResponseFormatter.hasNonEnglish(repaired)) {
+                finalText = repaired.trim();
+            } else {
+                finalText =
+                    ResponseFormatter.stripNonEnglishScripts(finalText) ||
+                    'Sorry, I could not phrase that in English. Please ask me again.';
+            }
+        }
+
         if (!finalText.trim()) {
             finalText = 'Sorry, I did not quite catch that. Could you say it again?';
         }
@@ -790,8 +810,34 @@ class AlexaAI {
         try {
             const data = await this.client.detectNsfw(field, {}, opts);
             const score = typeof data?.output?.nsfw_score === 'number' ? data.output.nsfw_score : null;
-            return { ok: true, score, nsfw: score == null ? null : score >= threshold, error: null, raw: data };
+            return { ok: true, score, nsfw: score == null ? null : score >= threshold, error: null, via: 'api', raw: data };
         } catch (err) {
+            // The dedicated model is Pro/login-only. As a best effort, ask
+            // the vision model for a safety score instead — works whenever
+            // the key can see images.
+            if (err.code === 'DEEPAI_LOGIN_REQUIRED' || err.code === 'DEEPAI_QUOTA_EXCEEDED') {
+                try {
+                    const media = Media.normalize(image);
+                    if (media) {
+                        const judged = await this.vision.describe(media,
+                            'Rate how sexually explicit this image is. Reply with ONLY a single decimal number between 0 (completely safe) and 1 (explicit), with no other text.');
+                        const m = /(?:0\.\d+|1(?:\.0+)?|0|1)/.exec(String(judged.description || judged.text || ''));
+                        if (judged.ok && m) {
+                            const score = Number(m[0]);
+                            return { ok: true, score, nsfw: score >= threshold, error: null, via: 'chat' };
+                        }
+                    }
+                } catch {
+                    /* fall through to the honest refusal */
+                }
+                return {
+                    ok: false,
+                    score: null,
+                    nsfw: null,
+                    error: 'DEEPAI_PRO_REQUIRED',
+                    message: 'nsfw-detector is only available to DeepAI Pro keys (it has no free/anonymous tier), and the vision fallback could not run on this key.',
+                };
+            }
             return { ok: false, score: null, nsfw: null, error: err.code || 'NSFW_FAILED', message: err.message };
         }
     }

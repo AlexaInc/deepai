@@ -126,6 +126,12 @@ class Config {
         this.curlImpersonatePath =
             opts.curlImpersonatePath || process.env.DEEPAI_CURL_IMPERSONATE || null;
         this.curlImpersonateTarget = opts.curlImpersonateTarget || 'chrome136';
+        // Optional proxy for /api/* calls (http/https/socks5 URL). Applied to
+        // the curl transports via -x; global fetch cannot honour it without
+        // the undici package, so 'auto' skips fetch entirely when this is set.
+        // Useful when the bot runs on a server IP that DeepAI refuses for
+        // anonymous generation.
+        this.proxy = opts.proxy || process.env.DEEPAI_PROXY || null;
         // ---- /api/* anonymous fallback ----------------------------------------
         // When a registered key is refused ("Pro members in good standing"),
         // retry once with a fresh anonymous key in the browser dialect
@@ -212,6 +218,10 @@ class Config {
             { max: 10, idleTimeoutMillis: 30000, connectionTimeoutMillis: 15000 },
             opts.pool || {}
         );
+
+        // Replies must be plain English: any CJK/Kana/Hangul in a model
+        // answer triggers one translation re-ask, then script stripping.
+        this.englishOnly = opts.englishOnly !== false;
 
         this.debug = Boolean(opts.debug);
         this.logger = opts.logger || console;

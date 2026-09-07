@@ -730,18 +730,44 @@ section('DeepAIClient — the whole endpoint surface (mocked transport)');
         const anonNsfw = calls.find((c) => DeepAIClient.isTryItKey(c.key));
         ok('anonymous nsfw retry uses the model-page dialect', anonNsfw && anonNsfw.form.generation_source === 'img');
 
-        // anonymousApiFallback:false keeps the refusal
+        // anonymousApiFallback:false keeps the refusal (no /api retry; the
+        // vision fallback may still run but makes no /api/nsfw-detector call)
         const strict = new AlexaAI({ key: '11111111-2222-3333-4444-555555555555', postgresUrl: 'postgres://u:p@localhost/db', autoMigrate: false, anonymousApiFallback: false });
-        calls.length = 0;
-        let fetchCalls = 0;
+        let apiCalls = 0;
         global.fetch = async (url, init = {}) => {
-            fetchCalls++;
+            if (/nsfw-detector$/.test(String(url))) apiCalls++;
             return { status: 402, headers: { get: () => 'application/json' }, text: async () => JSON.stringify({ status: 'APIs are only available for Pro members in good standing' }) };
         };
         const refused = await strict.detectNsfw(Buffer.from('fake-image-bytes'));
         global.fetch = realFetch;
-        ok('anonymousApiFallback:false surfaces the refusal', refused.ok === false && refused.error === 'DEEPAI_QUOTA_EXCEEDED');
-        ok('no anonymous retry was made', fetchCalls === 1);
+        ok('anonymousApiFallback:false surfaces the refusal', refused.ok === false && refused.error === 'DEEPAI_PRO_REQUIRED');
+        ok('no anonymous retry was made', apiCalls === 1);
+
+        // login-gated models map to DEEPAI_LOGIN_REQUIRED and never rotate keys
+        {
+            const cfg2 = new Config({ key: 'tryit-1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', keys: ['tryit-1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'tryit-2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'], postgresUrl: 'postgres://u:p@localhost/db', maxRetries: 0 });
+            const c2 = new DeepAIClient(cfg2);
+            const seen2 = [];
+            global.fetch = async (url, init = {}) => {
+                seen2.push(init.headers['api-key']);
+                return { status: 401, headers: { get: () => 'application/json' }, text: async () => JSON.stringify({ status: 'model only available to logged in users' }) };
+            };
+            let loginErr = null;
+            try { await c2.runApi('nsfw-detector', { image: 'https://x/y.png' }); } catch (e) { loginErr = e; }
+            global.fetch = realFetch;
+            ok('login-gated model raises DEEPAI_LOGIN_REQUIRED', loginErr?.code === 'DEEPAI_LOGIN_REQUIRED');
+            ok('no key rotation on login-gated models', seen2.length === 1);
+        }
+
+        // the vision fallback answers when the model refuses for plan reasons
+        {
+            const ai2 = new AlexaAI({ key: '11111111-2222-3333-4444-555555555555', postgresUrl: 'postgres://u:p@localhost/db', autoMigrate: false });
+            ai2.vision = { describe: async () => ({ ok: true, description: '0.85' }) };
+            global.fetch = async () => ({ status: 402, headers: { get: () => 'application/json' }, text: async () => JSON.stringify({ status: 'APIs are only available for Pro members in good standing' }) });
+            const judged = await ai2.detectNsfw(Buffer.from('fake'), { threshold: 0.7 });
+            global.fetch = realFetch;
+            ok('detectNsfw falls back to the vision model', judged.ok === true && judged.via === 'chat' && judged.score === 0.85 && judged.nsfw === true);
+        }
     }
     
 {
@@ -827,6 +853,22 @@ section('DeepAIClient — the whole endpoint surface (mocked transport)');
         try { await client.runApi('text2img', { text: 'cat' }); } catch (e) { thrown = e; }
         ok('fetch-only transport surfaces the refusal', thrown && /try this model/i.test(thrown.message));
         ok('fetch-only transport never shells out', curlCalled === false);
+    }
+
+    // 5. a proxy pins the chain to the curl transports and passes -x
+    {
+        let call = null;
+        DeepAIClient.execCurl = async (bin, args) => { call = { bin, args }; return '{"id":"p1","share_url":"https://deepai.org/p.png"}\n200'; };
+        const client = new DeepAIClient(new Config({
+            key: 'k', postgresUrl: 'postgres://u:p@localhost/db',
+            proxy: 'socks5://127.0.0.1:9050', maxRetries: 0,
+        }));
+        const chain = await client._transportChain();
+        ok('proxy removes fetch from the transport chain', !chain.includes('fetch') && chain.includes('curl'));
+        const data = await client.runApi('text2img', { text: 'cat' });
+        ok('proxied request succeeds through curl', data.share_url === 'https://deepai.org/p.png');
+        const xi = call.args.indexOf('-x');
+        ok('curl receives the proxy flag', xi !== -1 && call.args[xi + 1] === 'socks5://127.0.0.1:9050');
     }
 
     global.fetch = realFetch;
@@ -925,6 +967,19 @@ async function endToEndTests() {
         deepai.push('Sure! DeepAI can help you with that.');
         const leak = await ai.chat({ message: 'can you help me?', userId: '78151912841263@lid' });
         ok('vendor name never ships', !/deepai/i.test(leak.text));
+
+        // 7. A non-English reply is re-asked in English.
+        deepai.push('你好！很高兴认识你，Nimal。');
+        deepai.push('Hello! Very nice to meet you, Nimal.');
+        const zh = await ai.chat({ message: 'hi again', userId: '78151912841263@lid' });
+        check('Chinese reply is re-asked in English', zh.text, 'Hello! Very nice to meet you, Nimal.');
+
+        // 8. When the re-ask also fails, the CJK is stripped (or replaced).
+        deepai.push('这是一段完全中文的回答。');
+        deepai.push('还是中文。');
+        const zh2 = await ai.chat({ message: 'hello', userId: '78151912841263@lid' });
+        ok('unrecoverable reply carries no CJK', !/[\u4E00-\u9FFF]/.test(zh2.text));
+        ok('unrecoverable reply is non-empty', zh2.text.trim().length > 0);
     } finally {
         deepai.restore();
     }

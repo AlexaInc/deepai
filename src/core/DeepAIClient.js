@@ -741,7 +741,8 @@ class DeepAIClient {
         if (t === 'fetch') return ['fetch'];
         if (t === 'curl') return ['curl'];
         if (t === 'impersonate') return ['impersonate'];
-        const chain = ['fetch', 'curl'];
+        // A proxy can only be honoured by the curl transports.
+        const chain = this.config.proxy ? ['curl'] : ['fetch', 'curl'];
         if (await DeepAIClient.resolveImpersonateBinary(this.config)) chain.push('impersonate');
         return chain;
     }
@@ -793,6 +794,7 @@ class DeepAIClient {
             : this.apiKey;
 
         const args = impersonate ? ['--impersonate', this.config.curlImpersonateTarget] : [];
+        if (this.config.proxy) args.push('-x', this.config.proxy);
         args.push(
             url,
             '-sS', '--compressed',
@@ -1071,6 +1073,17 @@ class DeepAIClient {
     static _toError(status, body, statusMessage) {
         const msg = statusMessage || DeepAIClient._detectJsonStatus(body) || `HTTP ${status}`;
         const lowered = String(msg).toLowerCase();
+
+        // Login-gated models cannot be recovered by key rotation, anonymous
+        // retries or another transport — report them as their own error.
+        if (lowered.includes('model only available to logged in users')) {
+            return new DeepAIError(`DeepAI refused the request: ${msg}`, {
+                code: 'DEEPAI_LOGIN_REQUIRED',
+                status,
+                body,
+                retryable: false,
+            });
+        }
 
         const quotaHints = [
             'quota exceeded',

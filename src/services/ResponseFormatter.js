@@ -19,6 +19,23 @@
  * Fenced code blocks are protected and restored verbatim.
  */
 class ResponseFormatter {
+    // CJK ideographs, Kana, Hangul, fullwidth forms — the scripts that must
+    // never appear in an English-only reply.
+    static NON_ENGLISH_RE = /[\u2E80-\u2EFF\u3000-\u303F\u3040-\u30FF\u3130-\u318F\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF\uFF00-\uFFEF]/;
+
+    /** True when the text contains CJK/Kana/Hangul/fullwidth characters. */
+    static hasNonEnglish(text) {
+        return ResponseFormatter.NON_ENGLISH_RE.test(String(text || ''));
+    }
+
+    /** Remove CJK/Kana/Hangul/fullwidth runs (last-resort cleanup). */
+    static stripNonEnglishScripts(text) {
+        return String(text || '')
+            .replace(/([\u2E80-\u2EFF\u3000-\u303F\u3040-\u30FF\u3130-\u318F\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF\uFF00-\uFFEF])+/g, ' ')
+            .replace(/ {2,}/g, ' ')
+            .trim();
+    }
+
     /**
      * @param {string} reply
      * @returns {string}

@@ -908,6 +908,52 @@ retry: <anonymous refusal>`).
 purpose — emoji and typographic dashes render as garbage (Chinese-looking
 mojibake) in cmd.exe/PowerShell with a non-UTF-8 codepage.
 
+**Running on a VPS / server IP.** DeepAI refuses anonymous `/api/*` generation
+from data-center IPs ("Please try this model on deepai.org"), so image
+generation that works at home fails on a VPS. Two options:
+
+1. `proxy` option (2.5.0) — route the `/api/*` calls through a
+   residential/mobile proxy; the curl transports honour
+   `proxy: 'socks5://host:port'` / `http://host:port` (or `DEEPAI_PROXY`).
+   Global fetch cannot use the proxy, so `auto` switches to curl automatically
+   when one is configured.
+2. A DeepAI **Pro key** — works from any IP, no proxy needed.
+
+**English-only replies (`englishOnly`, 2.5.0, on by default).** The persona
+now instructs the model to answer in English only; if a reply still contains
+CJK/Kana/Hangul, the engine re-asks once for an English version and strips any
+remaining script as a last resort. Disable with `englishOnly: false`.
+
+**`detectNsfw()` on a free key.** The `nsfw-detector` model has **no free or
+anonymous tier** on DeepAI (no try-it on its model page; registered free keys
+get the Pro refusal). 2.5.0 therefore: (a) tries the API, (b) on a plan
+refusal asks the vision model for a score instead (`via: 'chat'` — works when
+the key can see images), (c) otherwise returns `error: 'DEEPAI_PRO_REQUIRED'`
+with a clear message. A Pro key makes the real model work.
+
+**Always check `result.ok` before sending media.** On failure every helper
+returns `url: null` — passing that straight to Baileys'
+`prepareWAMessageMedia` crashes the bot with
+`TypeError: Cannot read properties of undefined (reading 'toString')`. Guard
+the bot side:
+
+```js
+const r = await ai.generateImage(prompt);
+if (!r.ok || !r.url) {
+    await sock.sendMessage(jid, { text: `Image failed: ${r.message || r.error}` });
+    return;
+}
+try {
+    await sock.sendMessage(jid, { image: { url: r.url } });
+} catch (e) {
+    console.error('send failed', e);
+}
+```
+
+Also register `process.on('uncaughtException', …)` and
+`process.on('unhandledRejection', …)` handlers in the bot entrypoint so one
+bad send can never kill the whole process.
+
 **`generateImage()` returns `{ ok: false, error: 'DEEPAI_QUOTA_EXCEEDED' }`**
 `/api/text2img` is Pro-only for registered keys ("APIs are only available for
 Pro members in good standing"), the anonymous browser-shaped retry was
