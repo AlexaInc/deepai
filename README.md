@@ -872,7 +872,27 @@ separate requirements:
    cookie value) also helps the per-device quota.
 
 `examples/text2img-standalone.js` is a zero-dependency CLI implementing the
-full recipe.
+full recipe, and `examples/diagnose.js` runs the same request through every
+transport on your machine and prints which one DeepAI accepts.
+
+**`transport` option (2.3.0).** Some networks serve non-browser TLS stacks a
+refusal (`"Please try this model on deepai.org"`) even with a perfectly valid
+key. `/api/*` calls therefore support multiple transports:
+
+```js
+new AlexaAI({ key, postgresUrl, transport: 'auto' })   // default: fetch → curl → curl-impersonate
+new AlexaAI({ key, postgresUrl, transport: 'curl' })   // system curl only
+new AlexaAI({ key, postgresUrl, transport: 'impersonate', curlImpersonatePath: 'C:/tools/curl-impersonate.exe' })
+```
+
+With `transport: 'auto'` (the default) the engine starts with `fetch` and, on
+a transport-specific refusal, retries the request through system `curl`
+(shipped with Windows 10+, macOS and Linux) and then through a
+`curl-impersonate` binary if one is on PATH (a Chrome TLS profile; set
+`curlImpersonatePath` or `DEEPAI_CURL_IMPERSONATE` to point at it — builds:
+github.com/lexiforest/curl-impersonate/releases). Quota and auth errors are
+never re-driven through other transports. Run `node examples/diagnose.js` to
+see which transport your network accepts.
 
 **`generateImage()` returns `{ ok: false, error: 'DEEPAI_QUOTA_EXCEEDED' }`**
 `/api/text2img` is Pro-only for registered keys ("APIs are only available for

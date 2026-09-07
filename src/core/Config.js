@@ -23,6 +23,8 @@ class Config {
      * @param {string} [options.visionModel]       Model used when images are attached
      * @param {string[]} [options.visionModels]    Vision fallback chain
      * @param {string} [options.imageModel]        Model used by generateImage()
+     * @param {string} [options.transport]         /api/* transport: 'auto' (default) | 'fetch' | 'curl' | 'impersonate'
+     * @param {string} [options.curlImpersonatePath] Path to a curl-impersonate binary for the 'impersonate' transport
      * @param {string} [options.assistantName]     Persona name (default 'Alexa')
      * @param {string} [options.creator]           Persona creator (default 'Hansaka')
      * @param {string} [options.systemPrompt]      Override the whole persona text
@@ -111,6 +113,19 @@ class Config {
             'standard',
         ]);
         this.imageModel = opts.imageModel || 'text2img';
+
+        // ---- /api/* transport -------------------------------------------------
+        // 'auto'        fetch first, then system curl, then curl-impersonate
+        //               when the binary is available (some networks serve
+        //               non-browser TLS stacks a refusal page).
+        // 'fetch'       Node global fetch only (previous behaviour)
+        // 'curl'        system curl subprocess only
+        // 'impersonate' curl-impersonate subprocess only (Chrome TLS profile)
+        this.transport = opts.transport || process.env.DEEPAI_TRANSPORT || 'auto';
+        this.curlPath = opts.curlPath || process.env.DEEPAI_CURL || 'curl';
+        this.curlImpersonatePath =
+            opts.curlImpersonatePath || process.env.DEEPAI_CURL_IMPERSONATE || null;
+        this.curlImpersonateTarget = opts.curlImpersonateTarget || 'chrome136';
 
         // ---- Anonymous device identity ---------------------------------------
         // Stable device identifier sent as the `deepai_device_id` cookie.

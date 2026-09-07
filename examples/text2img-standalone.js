@@ -13,9 +13,16 @@
  *   node examples/text2img-standalone.js "a cat" --aspect 16:9
  *   node examples/text2img-standalone.js "a cat" --device-id <cookieValue>
  *   node examples/text2img-standalone.js "a cat" --key <proKey>
+ *   node examples/text2img-standalone.js "a cat" --transport curl
+ *   node examples/text2img-standalone.js "a cat" --transport impersonate --imp /path/to/curl-impersonate
  *
- * Requires Node.js 18+ (global fetch). Anonymous generation is refused
- * from datacenter/VPN IPs; run from a residential network.
+ * Transports: 'fetch' (default, Node fetch) | 'curl' (system curl) |
+ * 'impersonate' (curl-impersonate binary, Chrome TLS profile). Some
+ * networks serve non-browser TLS stacks a refusal — if 'fetch' fails with
+ * "Please try this model on deepai.org", try 'curl', then 'impersonate'.
+ *
+ * Requires Node.js 18+. Anonymous generation is refused from
+ * datacenter/VPN IPs; run from a residential network.
  */
 
 const API_URL = 'https://api.deepai.org/api/text2img';
@@ -65,7 +72,7 @@ function randomDeviceId() {
 // CLI
 // ---------------------------------------------------------------------------
 function parseArgs(argv) {
-    const opts = { prompt: '', out: null, key: null, deviceId: randomDeviceId(), aspect: null, genSource: 'img' };
+    const opts = { prompt: '', out: null, key: null, deviceId: randomDeviceId(), aspect: null, genSource: 'img', transport: 'fetch', imp: null };
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
         if (a === '--out') opts.out = argv[++i];
@@ -73,6 +80,8 @@ function parseArgs(argv) {
         else if (a === '--device-id') opts.deviceId = argv[++i];
         else if (a === '--aspect') opts.aspect = argv[++i];
         else if (a === '--chat-source') opts.genSource = 'chat';
+        else if (a === '--transport') opts.transport = argv[++i];
+        else if (a === '--imp') opts.imp = argv[++i];
         else if (a === '--help' || a === '-h') opts.help = true;
         else if (!opts.prompt) opts.prompt = a;
     }
@@ -84,7 +93,7 @@ const ASPECTS = { '16:9': [832, 448], '4:3': [768, 576], '1:1': [640, 640], '3:4
 async function main() {
     const opts = parseArgs(process.argv.slice(2));
     if (opts.help || !opts.prompt) {
-        console.log('Usage: node examples/text2img-standalone.js "your prompt" [--out file.jpg] [--key PRO_KEY] [--device-id VALUE] [--aspect 16:9|1:1|9:16|4:3|3:4] [--chat-source]');
+        console.log('Usage: node examples/text2img-standalone.js "your prompt" [--out file.jpg] [--key PRO_KEY] [--device-id VALUE] [--aspect 16:9|1:1|9:16|4:3|3:4] [--chat-source] [--transport fetch|curl|impersonate] [--imp PATH]');
         process.exit(opts.help ? 0 : 1);
     }
 
@@ -119,7 +128,39 @@ async function main() {
     console.log(`Key    : ${opts.key ? '(registered key — needs Pro)' : apiKey + '  (fresh, single-use)'}`);
     console.log('POST   : ' + API_URL);
 
-    const res = await fetch(API_URL, { method: 'POST', headers, body: form });
+    let res;
+    if (opts.transport === 'curl' || opts.transport === 'impersonate') {
+        const { execFile } = require('child_process');
+        const binary = opts.transport === 'impersonate' ? (opts.imp || 'curl-impersonate') : 'curl';
+        // the chrome136 profile sends its own Mac Chrome UA — the anonymous
+        // key hash must be derived from exactly that UA
+        const profileUa = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36';
+        const apiKey = opts.key || freshTryItKey(opts.transport === 'impersonate' ? profileUa : USER_AGENT);
+        const curlArgs = [];
+        if (opts.transport === 'impersonate') curlArgs.push('--impersonate', 'chrome136');
+        curlArgs.push(API_URL, '-sS', '--compressed', '--max-time', '120', '-X', 'POST',
+            '-H', `api-key: ${apiKey}`);
+        if (opts.transport !== 'impersonate') curlArgs.push('-H', `User-Agent: ${USER_AGENT}`);
+        curlArgs.push(
+            '-H', `Origin: ${headers.Origin}`,
+            '-H', `Referer: ${headers.Referer}`,
+            '-H', 'Accept: */*',
+            '-H', `Cookie: deepai_device_id=${opts.deviceId}`,
+            '-w', '\n%{http_code}'
+        );
+        for (const [k, v] of form.entries()) curlArgs.push('-F', `${k}=${v}`);
+        res = await new Promise((resolve, reject) => {
+            execFile(binary, curlArgs, { timeout: 120000, maxBuffer: 32 * 1024 * 1024 }, (err, stdout) => {
+                if (err && stdout == null) return reject(err);
+                const body = String(stdout).replace(/\r/g, '');
+                const cut = body.lastIndexOf('\n');
+                const status = Number(body.slice(cut + 1).trim());
+                resolve({ status, ok: status < 300, text: async () => body.slice(0, cut) });
+            });
+        });
+    } else {
+        res = await fetch(API_URL, { method: 'POST', headers, body: form });
+    }
     const raw = await res.text();
     let data = null;
     try { data = JSON.parse(raw); } catch { /* non-JSON */ }

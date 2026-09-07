@@ -708,7 +708,98 @@ section('DeepAIClient — the whole endpoint surface (mocked transport)');
         );
         ok('share_url is preferred over output_url', result.url === 'https://deepai.org/generated-image.png');
     }
-    const cfg = new Config({ key: 'k', postgresUrl: 'postgres://u:p@localhost/db' });
+    
+{
+    section('DeepAIClient — /api transport chain');
+
+    const realFetch = global.fetch;
+    const realExecCurl = DeepAIClient.execCurl;
+    const realCache = DeepAIClient._impersonateCache;
+
+    // 1. a transport-specific refusal ("Please try this model") falls through
+    //    to the next transport (fetch -> curl).
+    {
+        let curlCall = null;
+        global.fetch = async () => ({
+            status: 401,
+            headers: { get: () => 'application/json' },
+            text: async () => JSON.stringify({ status: 'Please try this model on deepai.org' }),
+        });
+        DeepAIClient.execCurl = async (bin, args) => {
+            curlCall = { bin, args };
+            return '{"id":"t1","share_url":"https://deepai.org/x.png"}\n200';
+        };
+        DeepAIClient._impersonateCache = Promise.resolve(null);
+        const client = new DeepAIClient(new Config({ key: 'tryit-1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', postgresUrl: 'postgres://u:p@localhost/db', maxRetries: 0 }));
+        const data = await client.runApi('text2img', { text: 'cat', generation_source: 'img' });
+        check('curl transport recovers a fetch refusal', data.share_url, 'https://deepai.org/x.png');
+        ok('curl transport received the form fields', curlCall.args.includes('text=cat') && curlCall.args.includes('generation_source=img'));
+        const key = curlCall.args.find((a) => a.startsWith('api-key: ')).slice(9);
+        ok('curl transport used a fresh anonymous key', DeepAIClient.isTryItKey(key));
+        ok('curl transport sends the Origin header', curlCall.args.includes('Origin: https://deepai.org'));
+    }
+
+    // 2. quota refusals are final — no transport cascade.
+    {
+        let curlCalled = false;
+        global.fetch = async () => ({
+            status: 402,
+            headers: { get: () => 'application/json' },
+            text: async () => JSON.stringify({ status: 'APIs are only available for Pro members in good standing' }),
+        });
+        DeepAIClient.execCurl = async () => { curlCalled = true; return '{}\n200'; };
+        const client = new DeepAIClient(new Config({ key: 'k', postgresUrl: 'postgres://u:p@localhost/db', maxRetries: 0 }));
+        let thrown = null;
+        try { await client.runApi('text2img', { text: 'cat' }); } catch (e) { thrown = e; }
+        ok('quota refusal throws QuotaExceededError', thrown?.name === 'QuotaExceededError' || thrown?.code === 'DEEPAI_QUOTA_EXCEEDED');
+        ok('no other transport is tried on quota refusals', curlCalled === false);
+    }
+
+    // 3. the impersonate transport uses the profile UA and derives the key
+    //    hash from it.
+    {
+        let call = null;
+        DeepAIClient.execCurl = async (bin, args) => { call = { bin, args }; return '{"id":"t2","output_url":"https://deepai.org/y.png"}\n200'; };
+        const client = new DeepAIClient(new Config({
+            key: 'tryit-1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            postgresUrl: 'postgres://u:p@localhost/db',
+            transport: 'impersonate',
+            curlImpersonatePath: '/fake/curl-impersonate',
+            maxRetries: 0,
+        }));
+        const data = await client.runApi('text2img', { text: 'cat' });
+        check('impersonate transport returns the image', data.output_url, 'https://deepai.org/y.png');
+        check('impersonate binary and profile are passed', [call.bin, call.args[0], call.args[1]], ['/fake/curl-impersonate', '--impersonate', 'chrome136']);
+        const ua = call.args.find((a) => a.startsWith('User-Agent: ')).slice(12);
+        const key = call.args.find((a) => a.startsWith('api-key: ')).slice(9);
+        const m = /^tryit-(\d+)-([0-9a-f]{32})$/.exec(key);
+        const H = DeepAIClient._islandHash;
+        const salt = 'hackers_become_a_little_stinkier_every_time_they_hack';
+        ok('impersonate key hash matches the profile User-Agent', m && m[2] === H(ua + H(ua + H(ua + m[1] + salt))));
+    }
+
+    // 4. transport:'fetch' never spawns a subprocess.
+    {
+        let curlCalled = false;
+        global.fetch = async () => ({
+            status: 401,
+            headers: { get: () => 'application/json' },
+            text: async () => JSON.stringify({ status: 'Please try this model on deepai.org' }),
+        });
+        DeepAIClient.execCurl = async () => { curlCalled = true; return '{}\n200'; };
+        const client = new DeepAIClient(new Config({ key: 'k', postgresUrl: 'postgres://u:p@localhost/db', transport: 'fetch', maxRetries: 0 }));
+        let thrown = null;
+        try { await client.runApi('text2img', { text: 'cat' }); } catch (e) { thrown = e; }
+        ok('fetch-only transport surfaces the refusal', thrown && /try this model/i.test(thrown.message));
+        ok('fetch-only transport never shells out', curlCalled === false);
+    }
+
+    global.fetch = realFetch;
+    DeepAIClient.execCurl = realExecCurl;
+    DeepAIClient._impersonateCache = realCache;
+}
+
+const cfg = new Config({ key: 'k', postgresUrl: 'postgres://u:p@localhost/db' });
     check('endpoint map exposes the chat route', cfg.url('chat'), 'https://api.deepai.org/hacking_is_a_serious_crime');
     check(
         'endpoint map builds query strings',

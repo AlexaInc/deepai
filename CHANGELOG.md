@@ -4,6 +4,22 @@ All notable changes to `alexa-ai` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.3.0] — 2026-09-07
+
+### Added
+- **Multiple `/api/*` transports** (`transport` option / `DEEPAI_TRANSPORT`):
+  `'auto'` (default) tries `fetch`, then system `curl`, then a
+  `curl-impersonate` binary (Chrome TLS profile) when one is available;
+  `'fetch' | 'curl' | 'impersonate'` pin a single transport. A refusal of the
+  form "Please try this model on deepai.org" can be specific to the client
+  TLS stack, so `auto` retries that error through the next transport — quota
+  and auth errors are never re-driven. `curlImpersonatePath` /
+  `DEEPAI_CURL_IMPERSONATE` locate the binary.
+- `examples/diagnose.js` — runs the browser-shaped request through every
+  transport with fresh keys and reports which one the network accepts.
+- `examples/text2img-standalone.js` gained `--transport fetch|curl|impersonate`
+  and `--imp <path>`.
+
 ## [2.2.1] — 2026-09-07
 
 ### Added

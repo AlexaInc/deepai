@@ -615,36 +615,232 @@ class DeepAIClient {
      * @returns {Promise<object>} e.g. `{ id, output_url }`
      */
     async runApi(name, fields = {}, options = {}) {
-        const form = new FormData();
-        for (const [key, value] of Object.entries(fields)) {
+        const url = `${this.config.url('api')}/${String(name).replace(/^\/+/, '')}`;
+        const entries = this._buildApiFields(fields, options);
+        return this._apiFormRequest(url, entries, options);
+    }
+
+    /**
+     * Normalise API form fields into a transport-neutral entry list:
+     * `[[key, { value | buffer, mimetype, filename }], …]`.
+     * @private
+     */
+    _buildApiFields(fields, options = {}) {
+        const entries = [];
+        for (const [key, value] of Object.entries(fields || {})) {
             if (value == null) continue;
-            if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
-                const mimetype = options.mimetype || DeepAIClient._sniffMime(value) || 'application/octet-stream';
-                form.append(key, new Blob([value], { type: mimetype }), options.filename || `${key}.${DeepAIClient._ext(mimetype)}`);
+            if (Buffer.isBuffer(value) || value instanceof Uint8Array || value instanceof Blob) {
+                entries.push([key, { buffer: value, mimetype: options.mimetype, filename: options.filename }]);
             } else if (typeof value === 'object' && (value.buffer || value.url)) {
                 if (value.url && !value.buffer) {
-                    form.append(key, String(value.url));
-                    continue;
+                    entries.push([key, { value: String(value.url) }]);
+                } else {
+                    entries.push([
+                        key,
+                        {
+                            buffer: Buffer.isBuffer(value.buffer) ? value.buffer : Buffer.from(value.buffer),
+                            mimetype: value.mimetype,
+                            filename: value.filename,
+                        },
+                    ]);
                 }
-                const bytes = Buffer.isBuffer(value.buffer) ? value.buffer : Buffer.from(value.buffer);
-                const mimetype = value.mimetype || DeepAIClient._sniffMime(bytes) || 'application/octet-stream';
-                form.append(key, new Blob([bytes], { type: mimetype }), value.filename || `${key}.${DeepAIClient._ext(mimetype)}`);
             } else if (typeof value === 'object') {
-                form.append(key, JSON.stringify(value));
+                entries.push([key, { value: JSON.stringify(value) }]);
             } else {
-                form.append(key, String(value));
+                entries.push([key, { value: String(value) }]);
             }
         }
-        const url = `${this.config.url('api')}/${String(name).replace(/^\/+/, '')}`;
-        const data = await this._json(url, { method: 'POST', body: form, signal: options.signal });
-        // The classic API reports failures as `{ err: "..." }` or `{ status: "..." }` with HTTP 200.
-        if (data?.err) {
-            throw DeepAIClient._toError(200, JSON.stringify(data), String(data.err));
+        return entries;
+    }
+
+    /**
+     * POST a multipart form to a `/api/*` URL across the configured transport
+     * chain. A refusal of the form "Please try this model on deepai.org" can
+     * be transport-specific (non-browser TLS stacks receive it even with a
+     * perfectly valid key), so on that error the next transport is tried;
+     * every other error (quota, auth, network) is final for this request.
+     * @private
+     */
+    async _apiFormRequest(url, entries, options = {}) {
+        const chain = await this._transportChain();
+        let lastError;
+        for (const transport of chain) {
+            try {
+                const raw = await this._runApiTransport(transport, url, entries, options);
+                const data = DeepAIClient._safeJson(raw.body);
+                if (raw.status > 299 || data === null) {
+                    throw DeepAIClient._toError(raw.status, raw.body, data?.status || data?.error);
+                }
+                if (data?.err) {
+                    throw DeepAIClient._toError(200, JSON.stringify(data), String(data.err));
+                }
+                if (typeof data?.status === 'string' && !data.share_url && !data.output_url && !data.output && !data.id) {
+                    throw DeepAIClient._toError(200, JSON.stringify(data), data.status);
+                }
+                return data;
+            } catch (err) {
+                if (DeepAIClient._isTransportRejected(err) && chain.length > 1) {
+                    lastError = err;
+                    if (this.config.debug) this.log.warn?.(`[AlexaAI] ${transport} transport refused for ${url}; trying the next`);
+                    continue;
+                }
+                if (err instanceof QuotaExceededError || err.retryable === false || err.code === 'ABORTED') throw err;
+                throw err;
+            }
         }
-        if (typeof data?.status === 'string' && !data.share_url && !data.output_url && !data.output && !data.id) {
-            throw DeepAIClient._toError(200, JSON.stringify(data), data.status);
+        throw lastError || new DeepAIError('DeepAI request failed', { code: 'DEEPAI_ERROR' });
+    }
+
+    /** @private */
+    static _isTransportRejected(err) {
+        return /try this model on deepai\.org/i.test(String(err?.message || ''));
+    }
+
+    /** Ordered transport list for /api/* calls. @private */
+    async _transportChain() {
+        const t = this.config.transport;
+        if (t === 'fetch') return ['fetch'];
+        if (t === 'curl') return ['curl'];
+        if (t === 'impersonate') return ['impersonate'];
+        const chain = ['fetch', 'curl'];
+        if (await DeepAIClient.resolveImpersonateBinary(this.config)) chain.push('impersonate');
+        return chain;
+    }
+
+    /** @private */
+    async _runApiTransport(transport, url, entries, options) {
+        if (transport === 'fetch') return this._runApiFetch(url, entries, options);
+        const impersonate = transport === 'impersonate';
+        const binary = impersonate
+            ? await DeepAIClient.resolveImpersonateBinary(this.config)
+            : this.config.curlPath;
+        return this._runApiCurl(binary, url, entries, options, { impersonate });
+    }
+
+    /** @private global-fetch transport (previous behaviour). */
+    async _runApiFetch(url, entries, options = {}) {
+        const form = new FormData();
+        for (const [key, field] of entries) {
+            if (field.buffer != null) {
+                const bytes = field.buffer instanceof Blob ? Buffer.from(await field.buffer.arrayBuffer()) : field.buffer;
+                const mimetype = field.mimetype || DeepAIClient._sniffMime(bytes) || 'application/octet-stream';
+                form.append(key, new Blob([bytes], { type: mimetype }), field.filename || `${key}.${DeepAIClient._ext(mimetype)}`);
+            } else {
+                form.append(key, field.value);
+            }
         }
-        return data;
+        const data = await this._json(url, { method: 'POST', body: form, signal: options.signal, errorCode: 'BAD_RESPONSE' });
+        return { status: 200, body: JSON.stringify(data) };
+    }
+
+    /**
+     * The User-Agent a curl-impersonate binary sends for the configured
+     * target profile. The anonymous key hash must be derived from the exact
+     * UA the request carries, so impersonated requests use the profile's own
+     * UA instead of `config.userAgent`.
+     * @private
+     */
+    static _impersonateUserAgent(target) {
+        const m = /chrome(\d+)/i.exec(String(target || ''));
+        const v = m ? m[1] : '136';
+        return `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${v}.0.0.0 Safari/537.36`;
+    }
+
+    /** @private curl / curl-impersonate subprocess transport. */
+    async _runApiCurl(binary, url, entries, options = {}, { impersonate = false } = {}) {
+        const ua = impersonate ? DeepAIClient._impersonateUserAgent(this.config.curlImpersonateTarget) : this.config.userAgent;
+        const apiKey = DeepAIClient.isTryItKey(this.apiKey)
+            ? DeepAIClient.generateTryItKey(ua)
+            : this.apiKey;
+
+        const args = impersonate ? ['--impersonate', this.config.curlImpersonateTarget] : [];
+        args.push(
+            url,
+            '-sS', '--compressed',
+            '--max-time', String(Math.max(1, Math.round(this.config.timeout / 1000))),
+            '-X', 'POST',
+            '-H', `api-key: ${apiKey}`,
+            '-H', `User-Agent: ${ua}`,
+            '-H', `Origin: ${this.config.origin}`,
+            '-H', `Referer: ${this.config.origin}/machine-learning-model/${this.config.imageModel}`,
+            '-H', 'Accept: */*',
+            '-H', 'Accept-Language: en-US,en;q=0.9',
+            '-w', '\n%{http_code}'
+        );
+        if (this.deviceId) args.push('-H', `Cookie: deepai_device_id=${this.deviceId}`);
+
+        const tmpFiles = [];
+        try {
+            for (const [key, field] of entries) {
+                if (field.buffer != null) {
+                    const bytes = field.buffer instanceof Blob ? Buffer.from(await field.buffer.arrayBuffer()) : field.buffer;
+                    const mimetype = field.mimetype || DeepAIClient._sniffMime(bytes) || 'application/octet-stream';
+                    const ext = DeepAIClient._ext(mimetype);
+                    const tmp = require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'alexa-')) + `/${key}.${ext}`;
+                    require('fs').writeFileSync(tmp, bytes);
+                    tmpFiles.push(tmp);
+                    args.push('-F', `${key}=@${tmp};type=${mimetype}`);
+                } else {
+                    args.push('-F', `${key}=${field.value}`);
+                }
+            }
+            const out = await DeepAIClient.execCurl(binary, args, this.config.timeout, options.signal);
+            const body = String(out).replace(/\r/g, '');
+            const idx = body.lastIndexOf('\n');
+            const status = Number(body.slice(idx + 1).trim());
+            if (!Number.isFinite(status)) {
+                throw new DeepAIError(`curl transport failed for ${url}: ${body.slice(0, 200)}`, {
+                    code: 'DEEPAI_NETWORK', retryable: true,
+                });
+            }
+            return { status, body: body.slice(0, idx) };
+        } finally {
+            for (const f of tmpFiles) { try { require('fs').unlinkSync(f); } catch { /* best effort */ } try { require('fs').rmSync(require('path').dirname(f), { recursive: true, force: true }); } catch { /* best effort */ } }
+        }
+    }
+
+    /**
+     * Locate a curl-impersonate binary: explicit path, then the usual
+     * executable names on PATH. Cached per path. Tests may override.
+     * @private
+     */
+    static async resolveImpersonateBinary(config) {
+        if (config.curlImpersonatePath) return config.curlImpersonatePath;
+        if (config._noImpersonateBinary) return null;
+        if (!DeepAIClient._impersonateCache) {
+            const { execFile } = require('child_process');
+            const names = process.platform === 'win32' ? ['curl-impersonate.exe', 'curl-impersonate'] : ['curl-impersonate'];
+            DeepAIClient._impersonateCache = new Promise((resolve) => {
+                let i = 0;
+                const tryNext = () => {
+                    if (i >= names.length) return resolve(null);
+                    const name = names[i++];
+                    execFile(name, ['--version'], { timeout: 5000 }, (err) => resolve(err ? tryNext() : name));
+                };
+                tryNext();
+            });
+        }
+        return DeepAIClient._impersonateCache;
+    }
+
+    /**
+     * Run a curl-compatible binary and capture stdout. Separated so tests
+     * can stub the subprocess layer.
+     * @private
+     */
+    static async execCurl(binary, args, timeoutMs, signal) {
+        const { execFile } = require('child_process');
+        return new Promise((resolve, reject) => {
+            const child = execFile(binary, args, { timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
+                if (err && stdout == null) return reject(new DeepAIError(`curl transport error: ${err.message}`, { code: 'DEEPAI_NETWORK', retryable: true }));
+                resolve(stdout != null ? stdout : '');
+                void stderr;
+            });
+            if (signal) {
+                if (signal.aborted) child.kill();
+                else signal.addEventListener('abort', () => child.kill(), { once: true });
+            }
+        });
     }
 
     /** Text-to-image (`/api/text2img`). Returns `{ id, output_url }`. */
