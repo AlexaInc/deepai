@@ -436,12 +436,10 @@ All media arguments accept the same shapes as `chat({ image })`.
    **fresh single-use key per request** — tryit keys are hash-validated
    against the User-Agent and burned after one request.
 2. If a registered (non-Pro) key is refused with `402 "Pro members in good
-   standing"`, one anonymous browser-shaped retry — the same thing
-   deepai.org does for logged-out visitors. (`noAnonymousFallback: true`
-   disables it.)
-3. The legacy in-chat `generate_image` function call (kept for older model
-   versions; 2025+ models answer in prose because the website now runs this
-   tool client-side).
+   standing"`, one anonymous browser-shaped retry. (`noAnonymousFallback:
+   true` disables it.)
+3. The legacy in-chat `generate_image` function call (kept for model
+   versions that still honour it).
 
 The result reports the route that answered (`via: 'api' | 'anonymous' |
 'chat'`). Options: `{ apiOnly }`, `{ chatToolOnly }`, `{ noAnonymousFallback }`,
@@ -855,16 +853,15 @@ error), and the reply came from DeepAI's own web access. Point
 blocked where the bot runs.
 
 **Works in the browser playground but fails in Postman / Node.js** — three
-separate traps, all verified live:
+separate requirements:
 
-1. **The playground's key is anonymous, single-use, and User-Agent-bound.**
-   Every click mints `tryit-<digits>-<hash>` where
-   `hash = H(UA + H(UA + H(UA + digits + "hackers_become_a_little_stinkier_every_time_they_hack")))`
-   and the server recomputes it from your `User-Agent` header. Copy the key
-   from DevTools (already burned) or invent random hex → `401 "Please pass a
-   valid Api-Key"`. A fresh, correctly-hashed key must be minted **per
-   request** — `DeepAIClient.generateTryItKey(userAgent)` does it, and
-   `headers()` mints one automatically for `tryit-…` keys.
+1. **Anonymous keys are single-use and User-Agent-bound.** Each key is
+   `tryit-<digits>-<hash>` with
+   `hash = H(UA + H(UA + H(UA + digits + "hackers_become_a_little_stinkier_every_time_they_hack")))`,
+   validated against the request's `User-Agent` header. A reused key or
+   random hex → `401 "Please pass a valid Api-Key"`. A fresh, correctly
+   hashed key must be minted per request — `headers()` does this
+   automatically for `tryit-…` keys.
 2. **The body must be `multipart/form-data`** (never JSON), with
    `generation_source=img` (model page) or `generation_source=chat` +
    `width`/`height`/`image_generator_version=hd`/`quality=true` (chat page).
@@ -875,7 +872,7 @@ separate traps, all verified live:
    cookie value) also helps the per-device quota.
 
 `examples/text2img-standalone.js` is a zero-dependency CLI implementing the
-full recipe; `DeepAI-TEXT2IMG-FIX.md` ships the same for Postman and cURL.
+full recipe.
 
 **`generateImage()` returns `{ ok: false, error: 'DEEPAI_QUOTA_EXCEEDED' }`**
 `/api/text2img` is Pro-only for registered keys ("APIs are only available for
@@ -885,13 +882,6 @@ with "Please try this model on deepai.org" — run the bot from a residential
 IP), and the in-chat tool produced no image. Add a Pro key, more keys
 (`keys: [...]`), or run from a non-datacenter IP. `message` carries DeepAI's
 exact wording for each attempted route.
-
-**`401 "Please pass a valid Api-Key"` with a tryit key** (fixed in 2.2.0)
-Older releases minted `tryit-…` keys with random hex. The server recomputes
-the hash from the request's User-Agent (`H(UA + H(UA + H(UA + digits +
-salt)))`) and rejects anything else. Keys are now minted with the real
-algorithm, and because they are single-use a fresh one is minted per request.
-Keep `userAgent` unchanged between requests if you persist keys.
 
 **Photos are answered with "I can't view images right now"**
 Native vision needs a paid DeepAI key; on a free key only text inside the

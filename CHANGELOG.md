@@ -7,81 +7,39 @@ All notable changes to `alexa-ai` are documented here. The format follows
 ## [2.2.1] — 2026-09-07
 
 ### Added
-- **Device identity** — the deepai.org client sets a `deepai_device_id`
-  cookie (32 random bytes, base64url) and sends it on every api.deepai.org
-  request; anonymous `/api/*` generation is rate-limited per device. The
-  client now keeps a stable random id per instance (`DeepAIClient.randomDeviceId()`)
-  and sends it as a cookie; override with `deviceId` / `DEEPAI_DEVICE_ID`
-  (e.g. paste the value from DevTools → Cookies to share the browser quota).
-- `examples/text2img-standalone.js` — zero-dependency CLI that generates an
-  image with the anonymous browser dialect (fresh hash-valid single-use key,
-  browser headers, form-data), independent of the engine. Companion guide:
-  `DEEPAI-TEXT2IMG-FIX.md` documents the full Postman / Node.js recipe.
-
-### Fixed
-- README troubleshooting for "works in the browser playground but fails in
-  Postman/Node": documented the three failure modes (single-use keys,
-  UA-bound key hash, form-data + Origin requirement) with working Postman
-  and cURL recipes.
+- Device identity: the client keeps a stable random `deepai_device_id`
+  (32 bytes, base64url) and sends it as a cookie; anonymous `/api/*`
+  generation is rate-limited per device. Override with `deviceId` /
+  `DEEPAI_DEVICE_ID`.
+- `examples/text2img-standalone.js` — zero-dependency CLI for anonymous
+  image generation using the full browser request dialect.
 
 ## [2.2.0] — 2026-09-07
 
 ### Fixed
-- **Image generation with anonymous `tryit-…` keys** — the root cause of every
-  "image generation failed" report. `generateTryItKey()` used to mint keys
-  with *random* hex (`tryit-<digits>-<random>`). The live API recomputes the
-  hex from the request's User-Agent (`H(UA + H(UA + H(UA + digits +
-  "hackers_become_a_little_stinkier_every_time_they_hack")))`, the hash deepai.org's
-  own client computes in `generateIslandKey()`), so every old key was refused
-  with `401 {"status":"Please pass a valid Api-Key…"}`. The real algorithm is
-  now ported verbatim (`DeepAIClient._islandHash`, verified bit-identical
-  against the site's minified source), and `generateTryItKey(userAgent)`
-  hashes the configured `userAgent`.
-- **Tryit keys are single-use** — one key authorises exactly one request
-  (the site calls `generateIslandKey()` before every fetch). `headers()` now
-  mints a fresh, correctly-hashed key per request whenever the active key is
-  anonymous, instead of replaying the stale one.
-- **`generateImage()` anonymous requests now speak the browser dialect.**
-  A bare `{ text }` form to `/api/text2img` is refused with
-  `{"status":"Please try this model on deepai.org"}`. The engine now sends
-  exactly what the site sends when pressing "Create image"
-  (`maybeHandleImageTool`): `generation_source=chat`, `width`/`height`
-  mapped from `aspectRatio` (`1:1→640×640`, `16:9→832×448`, `9:16→448×832`,
-  `4:3→768×576`, `3:4→576×768`), `image_generator_version=hd`,
-  `quality=true`.
+- Image generation with anonymous `tryit-…` keys. The key's hex part is a
+  deterministic hash over the User-Agent
+  (`H(UA + H(UA + H(UA + digits + SALT)))`, see `DeepAIClient._islandHash`);
+  `generateTryItKey(userAgent)` now derives it correctly, and `headers()`
+  mints a fresh key per request because anonymous keys are single-use.
+- `generateImage()` now sends the browser dialect for anonymous requests
+  (`generation_source`, `width`/`height` mapped from `aspectRatio`,
+  `image_generator_version`, `quality`).
 
 ### Added
-- **Anonymous browser-shaped retry for non-Pro keys.** A registered key
-  without Pro gets `402 "APIs are only available for Pro members in good
-  standing"`; `generateImage()` now retries once with a fresh anonymous key
-  in the full browser shape — the same fallback deepai.org uses for
-  logged-out visitors. Result `via` gained `'anonymous'`; disable with
-  `{ noAnonymousFallback: true }`. New client method:
-  `runApiWithTryItKey(name, fields)`.
-- `DEEPAI_KEY` is now accepted as an env alias alongside `DEEPAI_API_KEY`.
+- Anonymous browser-shaped retry when a registered non-Pro key is refused
+  (result `via: 'anonymous'`, `runApiWithTryItKey(name, fields)`); disable
+  with `{ noAnonymousFallback: true }`.
+- `DEEPAI_KEY` env alias alongside `DEEPAI_API_KEY`.
 - `DeepAIClient.isTryItKey(key)`.
 
 ### Changed
-- Refusal taxonomy: `"Pro members"`, `"good standing"`, `"model only
-  available…"`, `"insufficient_credits"`, `"pro user out of credits"`,
-  `"signed in try-it quota exceeded"` and `"please try this model"` now map
-  to `QuotaExceededError` / refusals instead of a generic `DEEPAI_ERROR`, so
-  key rotation and `error: 'DEEPAI_QUOTA_EXCEEDED'` reporting work as
-  designed.
-- `share_url` is preferred over `output_url` in generated-image results
-  (same order as the browser client).
-- Default `userAgent` bumped from Chrome/126 to Chrome/140 (the tryit-key
-  hash is computed over it; keep `userAgent` stable if you persist keys).
-- The legacy in-chat `generate_image` function-call route still runs last,
-  but 2025+ models answer in prose because the website executes that tool
-  client-side — the real image now comes from routes 1–2.
-
-### Notes
-- Verified live on 2026-09-07: registered-key chat (`CHAT OK`), the 402 Pro
-  refusal, and the anonymous soft block "Please try this model on
-  deepai.org", which DeepAI applies to data-centre IPs even for perfect
-  browser-shaped requests. Free anonymous image generation must be attempted
-  from a residential IP; Pro keys work from anywhere.
+- Extended refusal classification ("Pro members", "model only available…",
+  "insufficient_credits", …) so quota errors rotate keys and report
+  `DEEPAI_QUOTA_EXCEEDED` correctly.
+- `share_url` preferred over `output_url` in generated-image results.
+- Default `userAgent` updated (the tryit key hash is computed over it; keep
+  `userAgent` stable if you persist keys).
 
 ## [2.1.2] — 2026-09-06
 

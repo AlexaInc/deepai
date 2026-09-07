@@ -607,14 +607,11 @@ class AlexaAI {
      *      single-use, so a fresh one is minted per request.
      *   2. Anonymous browser-style retry — when a registered (non-Pro) key
      *      is refused with 402 "Pro members in good standing", the engine
-     *      retries once with a fresh anonymous key, exactly like the
-     *      deepai.org site does for logged-out visitors. Disable with
+     *      retries once with a fresh anonymous key. Disable with
      *      `{ noAnonymousFallback: true }`.
      *   3. The legacy in-chat image tool — a `generate_image` function-call
-     *      message sent to the chat endpoint. Current models usually answer
-     *      in prose ("I can't generate images") because 2025+ deepai.org
-     *      executes that tool client-side, but the route is kept for
-     *      model versions that still honor it.
+     *      message sent to the chat endpoint; kept for model versions that
+     *      still honor it.
      *
      * Either way the result is normalised to `{ ok, url, id, error, via }`
      * (`via` is 'api' | 'anonymous' | 'chat'). Every failure is returned,
@@ -641,9 +638,8 @@ class AlexaAI {
         let quotaRefused = false;
 
         // ---- 1. classic /api/text2img -------------------------------------
-        // With an anonymous tryit key we speak the exact browser dialect
-        // (generation_source + size/quality fields) — a bare { text } form
-        // is refused with "Please try this model on deepai.org".
+        // Anonymous keys require the browser dialect (generation_source +
+        // size/quality fields).
         if (!chatToolOnly) {
             try {
                 const extra = this.client.usingTryItKey
@@ -664,9 +660,8 @@ class AlexaAI {
 
         // ---- 2. anonymous browser-style retry ------------------------------
         // A registered key without Pro gets 402 "APIs are only available for
-        // Pro members in good standing". deepai.org itself keeps working for
-        // such visitors by falling back to a fresh anonymous key, so we do
-        // the same: one retry in the full browser shape.
+        // Pro members in good standing"; retry once with a fresh anonymous
+        // key in the full browser shape.
         if (quotaRefused && !noAnonymousFallback && !this.client.usingTryItKey) {
             try {
                 const extra = AlexaAI._browserImageFields(aspectRatio || '1:1', apiFields);
@@ -715,11 +710,9 @@ class AlexaAI {
     }
 
     /**
-     * Fields the deepai.org client sends when it presses the in-chat "Create
-     * image" button (maybeHandleImageTool): the aspect ratio is translated
-     * to pixel sizes, generation runs in "hd" with quality=true, and the
-     * request is tagged generation_source=chat. Without these fields the
-     * API refuses anonymous keys ("Please try this model on deepai.org").
+     * Extra form fields required for anonymous image generation: the aspect
+     * ratio is translated to pixel sizes, generation runs in "hd" quality,
+     * and the request is tagged generation_source=chat.
      *
      * @param {string} aspectRatio '1:1' | '16:9' | '9:16' | '4:3' | '3:4'
      * @param {object} [overrides] explicit width/height/image_generator_version win
@@ -1066,8 +1059,7 @@ class AlexaAI {
     /** @private the image url carried by an /api/* or tool response. */
     static _outputUrl(data) {
         if (!data || typeof data !== 'object') return null;
-        // The live API prefers share_url (stable, public) over output_url —
-        // same order as the browser client: `json.share_url || json.output_url`.
+        // Prefer share_url (stable, public) over output_url.
         const url = data.share_url || data.output_url || data.url || (Array.isArray(data.output) ? data.output[0] : null);
         return typeof url === 'string' && url ? url : null;
     }

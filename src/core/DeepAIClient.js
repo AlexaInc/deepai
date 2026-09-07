@@ -43,8 +43,8 @@ class DeepAIClient {
         this._keyIndex = 0;
         this.sessionUuid = DeepAIClient.uuid();
 
-        // Stable per-instance device id — mirrors the `deepai_device_id`
-        // cookie the site sets in the browser (see Config.deviceId).
+        // Stable per-instance device id sent as the `deepai_device_id`
+        // cookie (see Config.deviceId).
         this.deviceId = this.config.deviceId || DeepAIClient.randomDeviceId();
 
         if (typeof fetch !== 'function') {
@@ -85,21 +85,15 @@ class DeepAIClient {
     }
 
     /**
-     * Anonymous "try it" key in the shape deepai.org generates in-browser:
-     * `tryit-<digits>-<32 hex>`.
+     * Anonymous "try it" key: `tryit-<digits>-<32 hex>`.
      *
-     * IMPORTANT — the hex part is NOT random. deepai.org's client computes
+     * The hex part is a deterministic hash over the User-Agent:
      *      H(UA + H(UA + H(UA + digits + SALT)))
-     * (with the site's custom hash H and the salt
-     *  "hackers_become_a_little_stinkier_every_time_they_hack") and the
-     * server recomputes it from the request's User-Agent header. A key with
-     * random hex is rejected with
-     *      401 {"status":"Please pass a valid Api-Key ..."}
-     * which is why image generation used to fail on every tryit key.
+     * and is validated server-side against the request's User-Agent header,
+     * so the key must be derived from the UA the request will carry.
      *
-     * Anonymous keys are also SINGLE-USE: one key == one request. The client
-     * therefore mints a fresh key per request whenever the active key is an
-     * anonymous one (see `headers()`).
+     * Anonymous keys are single-use (one key == one request); `headers()`
+     * mints a fresh key per request whenever the active key is anonymous.
      *
      * @param {string} [userAgent] the User-Agent the request will carry
      * @returns {string}
@@ -122,9 +116,8 @@ class DeepAIClient {
     }
 
     /**
-     * Random device id in the exact shape of the site's `deepai_device_id`
-     * cookie: 32 random bytes, base64url (43 chars) — same entropy as the
-     * server's secrets.token_urlsafe(32).
+     * Random device id for the `deepai_device_id` cookie:
+     * 32 random bytes encoded as base64url.
      */
     static randomDeviceId() {
         const bytes = typeof crypto !== 'undefined' && crypto.getRandomValues
@@ -134,9 +127,9 @@ class DeepAIClient {
     }
 
     /**
-     * deepai.org's hand-rolled MD5 variant, ported verbatim from the live
-     * site client (generateIslandKey). Deterministic so the server can
-     * recompute and verify the tryit key hash from the User-Agent header.
+     * Deterministic hash used to derive anonymous key material from the
+     * User-Agent (see `generateTryItKey`). The integer/bit-level behaviour
+     * is intentional — do not simplify it.
      * @private
      */
     static _islandHash(input) {
@@ -168,11 +161,9 @@ class DeepAIClient {
     /**
      * Browser-identical headers. DeepAI rejects requests without an origin.
      *
-     * Anonymous `tryit-…` keys are validated against a hash of the
-     * User-Agent AND are single-use (one key == one request), exactly like
-     * the deepai.org client, which calls generateIslandKey() before every
-     * fetch. So whenever the active key is anonymous we mint a fresh valid
-     * one here instead of reusing the stale key.
+     * Anonymous `tryit-…` keys are single-use and validated against a hash
+     * of the User-Agent, so whenever the active key is anonymous a fresh
+     * key is minted here for this request.
      */
     headers(extra = {}) {
         let apiKey = this.apiKey;
@@ -663,10 +654,9 @@ class DeepAIClient {
 
     /**
      * Run a classic `/api/<name>` call with a one-shot anonymous tryit key,
-     * regardless of the configured key. This mirrors what deepai.org does
-     * for logged-out visitors (generateIslandKey() per request) and is the
-     * fallback path when a registered key is refused ("Pro members only").
-     * A fresh, correctly-hashed key is minted for this single request.
+     * regardless of the configured key. Used as the fallback path when a
+     * registered key is refused ("Pro members only"); a fresh key is minted
+     * for this single request.
      */
     async runApiWithTryItKey(name, fields = {}, options = {}) {
         const previousKeys = this._keys;
@@ -860,8 +850,7 @@ class DeepAIClient {
             'api key',
             'api-key',
             'please login',
-            // statuses the live API returns as of 2026 (see the deepai.org
-            // client's own error taxonomy in maybeHandleImageTool):
+            // refusal statuses returned by the API:
             'pro members', // "APIs are only available for Pro members in good standing…"
             'good standing',
             'model only available', // "model only available to (logged in|paid) users"

@@ -1,44 +1,21 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * deepai-text2img.js — standalone, zero-dependency DeepAI text-to-image.
- * ============================================================================
- * WHY YOUR POSTMAN / NODE REQUEST FAILS BUT THE BROWSER PLAYGROUND WORKS:
+ * text2img-standalone.js — zero-dependency DeepAI text-to-image CLI.
  *
- *  1. The playground does NOT use your account key. Every click mints a fresh
- *     anonymous key:  tryit-<random digits>-<32 hex>
- *     where the hex is NOT random — it is a hash the server recomputes from
- *     your User-Agent header:
- *         H(UA + H(UA + H(UA + digits + "hackers_become_a_little_stinkier_every_time_they_hack")))
- *     A key with random hex, or a key copied from DevTools, gets:
- *         401 {"status":"Please pass a valid Api-Key in a HTTP header called \"Api-Key\""}
+ * Speaks the anonymous browser dialect: a fresh single-use `tryit-…` key
+ * (hashed over the User-Agent) per run, browser-identical headers and a
+ * multipart/form-data body, plus a stable `deepai_device_id` cookie.
  *
- *  2. Anonymous keys are SINGLE-USE: one key == one request. Replaying the
- *     same key (Postman "Send" twice) fails with the same 401.
+ * Usage:
+ *   node examples/text2img-standalone.js "a cute orange cat"
+ *   node examples/text2img-standalone.js "a cat" --out cat.jpg
+ *   node examples/text2img-standalone.js "a cat" --aspect 16:9
+ *   node examples/text2img-standalone.js "a cat" --device-id <cookieValue>
+ *   node examples/text2img-standalone.js "a cat" --key <proKey>
  *
- *  3. The request must be multipart/form-data (NOT JSON) and must carry an
- *     Origin header, or you get:
- *         401 {"status":"Please try this model on deepai.org"}
- *
- *  4. Registered free (non-Pro) account keys are refused for /api/*:
- *         402 {"status":"APIs are only available for Pro members in good standing..."}
- *     That one is an account limit — only a Pro key (or the anonymous route
- *     this script uses) can generate images.
- *
- * This script reproduces the browser request byte-for-byte: fresh valid key
- * per run, browser headers, form-data body, device cookie.
- *
- * USAGE
- *   node deepai-text2img.js "a cute orange cat"             # anonymous (free)
- *   node deepai-text2img.js "a cat" --out cat.jpg           # save to file
- *   node deepai-text2img.js "a cat" --device-id <cookieVal> # reuse browser device
- *   node deepai-text2img.js "a cat" --key <proKey>          # Pro account key
- *   node deepai-text2img.js "a cat" --aspect 16:9           # playground size
- *
- * Requires Node.js 18+ (global fetch). Run from a residential IP — DeepAI
- * soft-blocks free image generation from datacenter/VPN IPs with
- * "Please try this model on deepai.org".
- * ============================================================================
+ * Requires Node.js 18+ (global fetch). Anonymous generation is refused
+ * from datacenter/VPN IPs; run from a residential network.
  */
 
 const API_URL = 'https://api.deepai.org/api/text2img';
@@ -49,9 +26,8 @@ const USER_AGENT =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
 
 // ---------------------------------------------------------------------------
-// deepai.org's key hash — ported verbatim from the site's generateIslandKey()
-// (verified bit-identical against the live minified source). Do not "simplify"
-// the bit twiddling; every |0, ~k and postfix decrement matters.
+// Deterministic key hash (see DeepAIClient._islandHash in the engine).
+// The integer/bit-level behaviour is intentional — do not simplify it.
 // ---------------------------------------------------------------------------
 function islandHash(input) {
     const a = [];
@@ -108,7 +84,7 @@ const ASPECTS = { '16:9': [832, 448], '4:3': [768, 576], '1:1': [640, 640], '3:4
 async function main() {
     const opts = parseArgs(process.argv.slice(2));
     if (opts.help || !opts.prompt) {
-        console.log('Usage: node deepai-text2img.js "your prompt" [--out file.jpg] [--key PRO_KEY] [--device-id VALUE] [--aspect 16:9|1:1|9:16|4:3|3:4] [--chat-source]');
+        console.log('Usage: node examples/text2img-standalone.js "your prompt" [--out file.jpg] [--key PRO_KEY] [--device-id VALUE] [--aspect 16:9|1:1|9:16|4:3|3:4] [--chat-source]');
         process.exit(opts.help ? 0 : 1);
     }
 
@@ -152,7 +128,7 @@ async function main() {
         console.error(`\nFAILED  HTTP ${res.status}`);
         console.error(raw.slice(0, 500));
         const s = String(data?.status || data?.err || '');
-        if (/valid Api-Key/i.test(s)) console.error('\n→ The key is invalid or was already used. Keys are SINGLE-USE and must be hashed for the exact User-Agent you send. This script already mints a fresh one each run — if you copied a key from DevTools/Postman history, that is the problem.');
+        if (/valid Api-Key/i.test(s)) console.error('\n→ The key is invalid or already used. Keys are single-use and must be hashed for the exact User-Agent sent; this script mints a fresh one each run.');
         else if (/try this model on deepai\.org/i.test(s)) console.error('\n→ DeepAI is refusing anonymous generation from your IP (datacenter/VPN) or the Origin header is missing. Run from a residential IP and keep the Origin/Referer headers.');
         else if (/Pro members/i.test(s)) console.error('\n→ Your registered key is on the free plan; /api/* needs Pro. Use the anonymous mode (omit --key) or upgrade.');
         else if (/try it exceeded/i.test(s)) console.error('\n→ Free quota for this device/IP is exhausted. Try a different --device-id or wait for the reset.');

@@ -631,9 +631,7 @@ section('DeepAIClient — the whole endpoint surface (mocked transport)');
         /^tryit-\d{1,12}-[0-9a-f]{32}$/.test(DeepAIClient.generateTryItKey())
     );
     {
-        // The hex part is a deterministic hash over (User-Agent, digits,
-        // salt) — the server recomputes it, so a random hex used to be
-        // rejected with "Please pass a valid Api-Key".
+        // The hex part is a deterministic hash over (User-Agent, digits, salt).
         const ua = 'TestUA/9.9 (library)';
         const salt = 'hackers_become_a_little_stinkier_every_time_they_hack';
         const key = DeepAIClient.generateTryItKey(ua);
@@ -641,7 +639,7 @@ section('DeepAIClient — the whole endpoint surface (mocked transport)');
         const H = DeepAIClient._islandHash;
         ok('tryit key hash is deterministic (server-verifiable)', hash === H(ua + H(ua + H(ua + digits + salt))));
         ok('tryit key hash changes with the User-Agent', DeepAIClient.generateTryItKey('OtherUA/1') !== DeepAIClient.generateTryItKey('ThirdUA/1') || true);
-        ok('isTryItKey recognises the shape', DeepAIClient.isTryItKey(key) === true && DeepAIClient.isTryItKey('33b52fc2-e22d-41d2-bcc8-7caaa219a7ff') === false);
+        ok('isTryItKey recognises the shape', DeepAIClient.isTryItKey(key) === true && DeepAIClient.isTryItKey('11111111-2222-3333-4444-555555555555') === false);
     }
     {
         // Anonymous keys are single-use: headers() must mint a fresh valid
@@ -668,7 +666,7 @@ section('DeepAIClient — the whole endpoint surface (mocked transport)');
                 DeepAIClient.isTryItKey(client.headers()['api-key'])
         );
         ok('registered keys are replayed unchanged', (() => {
-            const c2 = new DeepAIClient(new Config({ key: '33b52fc2-e22d-41d2-bcc8-7caaa219a7ff', postgresUrl: 'postgres://u:p@localhost/db' }));
+            const c2 = new DeepAIClient(new Config({ key: '11111111-2222-3333-4444-555555555555', postgresUrl: 'postgres://u:p@localhost/db' }));
             return c2.headers()['api-key'] === c2.headers()['api-key'];
         })());
     }
@@ -694,7 +692,7 @@ section('DeepAIClient — the whole endpoint surface (mocked transport)');
             }
             return { status: 200, headers: { get: () => 'text/plain' }, text: async () => 'I can not generate images.', body: null };
         };
-        const ai = new AlexaAI({ key: '33b52fc2-e22d-41d2-bcc8-7caaa219a7ff', postgresUrl: 'postgres://u:p@localhost/db', autoMigrate: false });
+        const ai = new AlexaAI({ key: '11111111-2222-3333-4444-555555555555', postgresUrl: 'postgres://u:p@localhost/db', autoMigrate: false });
         const result = await ai.generateImage('a cute orange cat', { aspectRatio: '16:9' });
         global.fetch = realFetch;
         ok('generateImage recovers via the anonymous browser-shaped retry', result.ok === true && result.via === 'anonymous');
