@@ -126,6 +126,12 @@ class Config {
         this.curlImpersonatePath =
             opts.curlImpersonatePath || process.env.DEEPAI_CURL_IMPERSONATE || null;
         this.curlImpersonateTarget = opts.curlImpersonateTarget || 'chrome136';
+        // ---- /api/* anonymous fallback ----------------------------------------
+        // When a registered key is refused ("Pro members in good standing"),
+        // retry once with a fresh anonymous key in the browser dialect
+        // (options.anonymousExtraFields). Mirrors how the website keeps
+        // working for free visitors. Disable with anonymousApiFallback:false.
+        this.anonymousApiFallback = opts.anonymousApiFallback !== false;
 
         // ---- Anonymous device identity ---------------------------------------
         // Stable device identifier sent as the `deepai_device_id` cookie.

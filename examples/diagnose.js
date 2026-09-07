@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * diagnose.js — DeepAI text2img connectivity diagnostic.
+ * diagnose.js - DeepAI text2img connectivity diagnostic.
  *
  * Run ON THE MACHINE where the browser playground works:
  *
@@ -93,19 +93,19 @@ function runCurl(binary, impersonate) {
 
 function label(t) {
     const b = String(t.body).slice(0, 140).replace(/\s+/g, ' ');
-    if (t.status === 200 && /share_url|output_url/.test(t.body)) return `✅ SUCCESS — image generated (HTTP 200)`;
-    if (/valid Api-Key/i.test(b)) return `❌ key rejected (unexpected — fresh key was used)`;
-    if (/try this model/i.test(b)) return `❌ transport refused ("Please try this model on deepai.org")`;
-    if (/Pro members/i.test(b)) return `❌ account-level refusal (needs a Pro key)`;
-    if (/try it exceeded/i.test(b)) return `⚠️ free quota exhausted for this device/IP — retry later or change --device-id`;
-    return `❌ HTTP ${t.status}: ${b}`;
+    if (t.status === 200 && /share_url|output_url/.test(t.body)) return `[OK] SUCCESS - image generated (HTTP 200)`;
+    if (/valid Api-Key/i.test(b)) return `[FAIL] key rejected (unexpected - fresh key was used)`;
+    if (/try this model/i.test(b)) return `[FAIL] transport refused ("Please try this model on deepai.org")`;
+    if (/Pro members/i.test(b)) return `[FAIL] account-level refusal (needs a Pro key)`;
+    if (/try it exceeded/i.test(b)) return `[WARN] free quota exhausted for this device/IP - retry later or change --device-id`;
+    return `[FAIL] HTTP ${t.status}: ${b}`;
 }
 
 (async () => {
-    console.log(`DeepAI text2img diagnostic — device ${deviceId.slice(0, 8)}…\n`);
+    console.log(`DeepAI text2img diagnostic - device ${deviceId.slice(0, 8)}...\n`);
     const rows = [];
-    try { rows.push(['1. Node fetch (library default)', label(await viaFetch())]); } catch (e) { rows.push(['1. Node fetch', `⚠️ ${e.message}`]); }
-    try { rows.push(['2. system curl', label(runCurl('curl', false))]); } catch (e) { rows.push(['2. system curl', `⚠️ ${e.message.split('\n')[0]}`]); }
+    try { rows.push(['1. Node fetch (library default)', label(await viaFetch())]); } catch (e) { rows.push(['1. Node fetch', `[WARN] ${e.message}`]); }
+    try { rows.push(['2. system curl', label(runCurl('curl', false))]); } catch (e) { rows.push(['2. system curl', `[WARN] ${e.message.split('\n')[0]}`]); }
 
     let impBin = opt.imp;
     if (!impBin) {
@@ -115,20 +115,20 @@ function label(t) {
         }
     }
     if (impBin) {
-        try { rows.push([`3. curl-impersonate (${impBin})`, label(runCurl(impBin, true))]); } catch (e) { rows.push(['3. curl-impersonate', `⚠️ ${e.message.split('\n')[0]}`]); }
+        try { rows.push([`3. curl-impersonate (${impBin})`, label(runCurl(impBin, true))]); } catch (e) { rows.push(['3. curl-impersonate', `[WARN] ${e.message.split('\n')[0]}`]); }
     } else {
-        rows.push(['3. curl-impersonate', '⏭ skipped — binary not found (see README for install)']);
+        rows.push(['3. curl-impersonate', '[SKIP] skipped - binary not found (see README for install)']);
     }
 
     for (const [name, v] of rows) console.log(`${name.padEnd(34)} ${v}`);
     console.log(`
 Reading the results:
-- A ✅ on ANY line    → that transport works; use it (library: transport option,
+- A [OK] on ANY line    -> that transport works; use it (library: transport option,
                         standalone: --transport).
-- ❌ on line 1 only   → non-browser TLS stack refused; use 'curl' or
+- [FAIL] on line 1 only   -> non-browser TLS stack refused; use 'curl' or
                         'impersonate'.
-- ❌ on lines 1+2, ✅ on 3 → strict browser-TLS matching; use 'impersonate'.
-- ❌ everywhere      → the IP is refused for anonymous generation, or the free
+- [FAIL] on lines 1+2, [OK] on 3 -> strict browser-TLS matching; use 'impersonate'.
+- [FAIL] everywhere      -> the IP is refused for anonymous generation, or the free
                         quota is exhausted. Compare with the browser: DevTools
-                        → Network → generate → text2img request → Response.`);
+                        -> Network -> generate -> text2img request -> Response.`);
 })();

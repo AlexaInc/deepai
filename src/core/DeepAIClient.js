@@ -615,9 +615,48 @@ class DeepAIClient {
      * @returns {Promise<object>} e.g. `{ id, output_url }`
      */
     async runApi(name, fields = {}, options = {}) {
-        const url = `${this.config.url('api')}/${String(name).replace(/^\/+/, '')}`;
-        const entries = this._buildApiFields(fields, options);
-        return this._apiFormRequest(url, entries, options);
+        try {
+            const url = `${this.config.url('api')}/${String(name).replace(/^\/+/, '')}`;
+            const entries = this._buildApiFields(fields, options);
+            return await this._apiFormRequest(url, entries, options);
+        } catch (err) {
+            // A registered key refused for plan reasons ("Pro members in
+            // good standing") gets one anonymous browser-shaped retry, the
+            // same way the website keeps serving free visitors.
+            if (
+                err instanceof QuotaExceededError &&
+                this.config.anonymousApiFallback !== false &&
+                !options._anonymous &&
+                !this.usingTryItKey
+            ) {
+                const anonFields = { ...(options.anonymousExtraFields || {}), ...fields };
+                if (this.config.debug) this.log.warn?.(`[AlexaAI] ${name} refused for the registered key; retrying anonymously`);
+                return this._runAnonymousApi(name, anonFields, options).catch((anonErr) => {
+                    anonErr.message = `${err.message} | anonymous retry: ${anonErr.message}`;
+                    throw anonErr;
+                });
+            }
+            throw err;
+        }
+    }
+
+    /**
+     * Run one `/api/<name>` call with a one-shot anonymous key regardless of
+     * the configured key. The active keys are swapped out for the duration
+     * of the call and restored afterwards.
+     * @private
+     */
+    async _runAnonymousApi(name, fields, options = {}) {
+        const previousKeys = this._keys;
+        const previousIndex = this._keyIndex;
+        this._keys = [DeepAIClient.generateTryItKey(this.config.userAgent)];
+        this._keyIndex = 0;
+        try {
+            return await this.runApi(name, fields, { ...options, _anonymous: true });
+        } finally {
+            this._keys = previousKeys;
+            this._keyIndex = previousIndex;
+        }
     }
 
     /**
@@ -849,47 +888,45 @@ class DeepAIClient {
     }
 
     /**
-     * Run a classic `/api/<name>` call with a one-shot anonymous tryit key,
-     * regardless of the configured key. Used as the fallback path when a
-     * registered key is refused ("Pro members only"); a fresh key is minted
-     * for this single request.
+     * Run a classic `/api/<name>` call with a one-shot anonymous key,
+     * regardless of the configured key (public wrapper).
      */
     async runApiWithTryItKey(name, fields = {}, options = {}) {
-        const previousKeys = this._keys;
-        const previousIndex = this._keyIndex;
-        this._keys = [DeepAIClient.generateTryItKey(this.config.userAgent)];
-        this._keyIndex = 0;
-        try {
-            return await this.runApi(name, fields, options);
-        } finally {
-            this._keys = previousKeys;
-            this._keyIndex = previousIndex;
-        }
+        return this._runAnonymousApi(name, { ...(options.anonymousExtraFields || {}), ...fields }, { ...options, _anonymous: true });
     }
 
     /** Prompt-driven image edit (`/api/image-editor`). */
-    async editImage(image, text, extra = {}) {
-        return this.runApi(STANDARD_APIS.imageEditor, { image, text, ...extra });
+    async editImage(image, text, extra = {}, options = {}) {
+        return this.runApi(STANDARD_APIS.imageEditor, { image, text, ...extra }, options);
     }
 
     /** 4x upscale (`/api/torch-srgan`). */
-    async upscaleImage(image, extra = {}) {
-        return this.runApi(STANDARD_APIS.superResolution, { image, ...extra });
+    async upscaleImage(image, extra = {}, options = {}) {
+        return this.runApi(STANDARD_APIS.superResolution, { image, ...extra }, options);
     }
 
     /** Colourise a black-and-white photo (`/api/colorizer`). */
-    async colorizeImage(image, extra = {}) {
-        return this.runApi(STANDARD_APIS.colorizer, { image, ...extra });
+    async colorizeImage(image, extra = {}, options = {}) {
+        return this.runApi(STANDARD_APIS.colorizer, { image, ...extra }, {
+            anonymousExtraFields: { generation_source: 'img' },
+            ...options,
+        });
     }
 
     /** NSFW score (`/api/nsfw-detector`). */
-    async detectNsfw(image, extra = {}) {
-        return this.runApi(STANDARD_APIS.nsfwDetector, { image, ...extra });
+    async detectNsfw(image, extra = {}, options = {}) {
+        return this.runApi(STANDARD_APIS.nsfwDetector, { image, ...extra }, {
+            anonymousExtraFields: { generation_source: 'img' },
+            ...options,
+        });
     }
 
     /** Abstractive summary (`/api/summarization`). */
-    async summarize(text, extra = {}) {
-        return this.runApi(STANDARD_APIS.summarization, { text, ...extra });
+    async summarize(text, extra = {}, options = {}) {
+        return this.runApi(STANDARD_APIS.summarization, { text, ...extra }, {
+            anonymousExtraFields: { generation_source: 'img' },
+            ...options,
+        });
     }
 
     /** Sentiment labels (`/api/sentiment-analysis`). */

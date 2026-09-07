@@ -154,7 +154,7 @@ class ImageDescriber {
                     sawRefusal = true;
                     this._modelsRefused.add(model);
                     if (this.config.debug) {
-                        this.log.warn?.(`[AlexaAI] ${model} cannot see attachments — trying the next model`);
+                        this.log.warn?.(`[AlexaAI] ${model} cannot see attachments - trying the next model`);
                     }
                     continue;
                 }

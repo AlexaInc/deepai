@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 'use strict';
 /**
- * text2img-standalone.js — zero-dependency DeepAI text-to-image CLI.
+ * text2img-standalone.js - zero-dependency DeepAI text-to-image CLI.
  *
- * Speaks the anonymous browser dialect: a fresh single-use `tryit-…` key
+ * Speaks the anonymous browser dialect: a fresh single-use `tryit-...` key
  * (hashed over the User-Agent) per run, browser-identical headers and a
  * multipart/form-data body, plus a stable `deepai_device_id` cookie.
  *
@@ -18,7 +18,7 @@
  *
  * Transports: 'fetch' (default, Node fetch) | 'curl' (system curl) |
  * 'impersonate' (curl-impersonate binary, Chrome TLS profile). Some
- * networks serve non-browser TLS stacks a refusal — if 'fetch' fails with
+ * networks serve non-browser TLS stacks a refusal - if 'fetch' fails with
  * "Please try this model on deepai.org", try 'curl', then 'impersonate'.
  *
  * Requires Node.js 18+. Anonymous generation is refused from
@@ -27,20 +27,20 @@
 
 const API_URL = 'https://api.deepai.org/api/text2img';
 const SALT = 'hackers_become_a_little_stinkier_every_time_they_hack';
-// Keep this EXACT string in sync with the User-Agent header below — the key
+// Keep this EXACT string in sync with the User-Agent header below - the key
 // hash is computed over it and the server recomputes it from the request.
 const USER_AGENT =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
 
 // ---------------------------------------------------------------------------
 // Deterministic key hash (see DeepAIClient._islandHash in the engine).
-// The integer/bit-level behaviour is intentional — do not simplify it.
+// The integer/bit-level behaviour is intentional - do not simplify it.
 // ---------------------------------------------------------------------------
 function islandHash(input) {
     const a = [];
     for (let b = 0; 64 > b; ) a[b] = 0 | (4294967296 * Math.sin(++b % Math.PI));
     let d, e, f, g = [(d = 1732584193), (e = 4023233417), ~d, ~e], h = [];
-    const l = unescape(encodeURI(input)) + '';
+    const l = unescape(encodeURI(input)) + '\u0080';
     let k = l.length;
     let c = (--k / 4 + 2) | 15;
     for (h[--c] = 8 * k; ~k; ) h[k >> 2] |= l.charCodeAt(k) << (8 * k--);
@@ -120,19 +120,19 @@ async function main() {
         Accept: '*/*',
         'Accept-Language': 'en-US,en;q=0.9',
         Cookie: `deepai_device_id=${opts.deviceId}`,
-        // NOTE: do NOT set Content-Type yourself — undici adds the multipart
+        // NOTE: do NOT set Content-Type yourself - undici adds the multipart
         // boundary. A manual Content-Type without the boundary is rejected.
     };
 
     console.log(`Prompt : ${opts.prompt}`);
-    console.log(`Key    : ${opts.key ? '(registered key — needs Pro)' : apiKey + '  (fresh, single-use)'}`);
+    console.log(`Key    : ${opts.key ? '(registered key - needs Pro)' : apiKey + '  (fresh, single-use)'}`);
     console.log('POST   : ' + API_URL);
 
     let res;
     if (opts.transport === 'curl' || opts.transport === 'impersonate') {
         const { execFile } = require('child_process');
         const binary = opts.transport === 'impersonate' ? (opts.imp || 'curl-impersonate') : 'curl';
-        // the chrome136 profile sends its own Mac Chrome UA — the anonymous
+        // the chrome136 profile sends its own Mac Chrome UA - the anonymous
         // key hash must be derived from exactly that UA
         const profileUa = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36';
         const apiKey = opts.key || freshTryItKey(opts.transport === 'impersonate' ? profileUa : USER_AGENT);
@@ -169,10 +169,10 @@ async function main() {
         console.error(`\nFAILED  HTTP ${res.status}`);
         console.error(raw.slice(0, 500));
         const s = String(data?.status || data?.err || '');
-        if (/valid Api-Key/i.test(s)) console.error('\n→ The key is invalid or already used. Keys are single-use and must be hashed for the exact User-Agent sent; this script mints a fresh one each run.');
-        else if (/try this model on deepai\.org/i.test(s)) console.error('\n→ DeepAI is refusing anonymous generation from your IP (datacenter/VPN) or the Origin header is missing. Run from a residential IP and keep the Origin/Referer headers.');
-        else if (/Pro members/i.test(s)) console.error('\n→ Your registered key is on the free plan; /api/* needs Pro. Use the anonymous mode (omit --key) or upgrade.');
-        else if (/try it exceeded/i.test(s)) console.error('\n→ Free quota for this device/IP is exhausted. Try a different --device-id or wait for the reset.');
+        if (/valid Api-Key/i.test(s)) console.error('\n-> The key is invalid or already used. Keys are single-use and must be hashed for the exact User-Agent sent; this script mints a fresh one each run.');
+        else if (/try this model on deepai\.org/i.test(s)) console.error('\n-> DeepAI is refusing anonymous generation from your IP (datacenter/VPN) or the Origin header is missing. Run from a residential IP and keep the Origin/Referer headers.');
+        else if (/Pro members/i.test(s)) console.error('\n-> Your registered key is on the free plan; /api/* needs Pro. Use the anonymous mode (omit --key) or upgrade.');
+        else if (/try it exceeded/i.test(s)) console.error('\n-> Free quota for this device/IP is exhausted. Try a different --device-id or wait for the reset.');
         process.exit(1);
     }
 
@@ -190,10 +190,10 @@ async function main() {
             require('fs').writeFileSync(out, buf);
             console.log(`Saved  : ${out} (${(buf.length / 1024).toFixed(1)} KB)`);
         } else {
-            console.log(`(download skipped: HTTP ${img.status} — open the URL above in a browser)`);
+            console.log(`(download skipped: HTTP ${img.status} - open the URL above in a browser)`);
         }
     } catch (e) {
-        console.log(`(download failed: ${e.message} — open the URL above in a browser)`);
+        console.log(`(download failed: ${e.message} - open the URL above in a browser)`);
     }
 }
 

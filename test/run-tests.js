@@ -695,7 +695,7 @@ section('DeepAIClient — the whole endpoint surface (mocked transport)');
         const ai = new AlexaAI({ key: '11111111-2222-3333-4444-555555555555', postgresUrl: 'postgres://u:p@localhost/db', autoMigrate: false });
         const result = await ai.generateImage('a cute orange cat', { aspectRatio: '16:9' });
         global.fetch = realFetch;
-        ok('generateImage recovers via the anonymous browser-shaped retry', result.ok === true && result.via === 'anonymous');
+        ok('generateImage recovers through the built-in anonymous fallback', result.ok === true && result.via === 'api');
         const anon = calls.find((c) => DeepAIClient.isTryItKey(c.key));
         ok(
             'anonymous retry carries the browser fields',
@@ -707,6 +707,41 @@ section('DeepAIClient — the whole endpoint surface (mocked transport)');
                 anon.form.quality === 'true'
         );
         ok('share_url is preferred over output_url', result.url === 'https://deepai.org/generated-image.png');
+
+        // detectNsfw: same Pro refusal, same anonymous recovery
+        calls.length = 0;
+        global.fetch = async (url, init = {}) => {
+            const form = {};
+            for (const [k, v] of init.body.entries()) form[k] = v;
+            calls.push({ url, key: init.headers['api-key'], form });
+            const first = calls.filter((c) => /nsfw-detector$/.test(c.url)).length === 1;
+            return {
+                status: first ? 402 : 200,
+                headers: { get: () => 'application/json' },
+                text: async () =>
+                    first
+                        ? JSON.stringify({ status: 'APIs are only available for Pro members in good standing' })
+                        : JSON.stringify({ id: 'n1', output: { nsfw_score: 0.13 } }),
+            };
+        };
+        const nsfw = await ai.detectNsfw(Buffer.from('fake-image-bytes'));
+        global.fetch = realFetch;
+        ok('detectNsfw recovers through the anonymous fallback', nsfw.ok === true && nsfw.score === 0.13 && nsfw.nsfw === false);
+        const anonNsfw = calls.find((c) => DeepAIClient.isTryItKey(c.key));
+        ok('anonymous nsfw retry uses the model-page dialect', anonNsfw && anonNsfw.form.generation_source === 'img');
+
+        // anonymousApiFallback:false keeps the refusal
+        const strict = new AlexaAI({ key: '11111111-2222-3333-4444-555555555555', postgresUrl: 'postgres://u:p@localhost/db', autoMigrate: false, anonymousApiFallback: false });
+        calls.length = 0;
+        let fetchCalls = 0;
+        global.fetch = async (url, init = {}) => {
+            fetchCalls++;
+            return { status: 402, headers: { get: () => 'application/json' }, text: async () => JSON.stringify({ status: 'APIs are only available for Pro members in good standing' }) };
+        };
+        const refused = await strict.detectNsfw(Buffer.from('fake-image-bytes'));
+        global.fetch = realFetch;
+        ok('anonymousApiFallback:false surfaces the refusal', refused.ok === false && refused.error === 'DEEPAI_QUOTA_EXCEEDED');
+        ok('no anonymous retry was made', fetchCalls === 1);
     }
     
 {

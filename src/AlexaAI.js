@@ -642,10 +642,14 @@ class AlexaAI {
         // size/quality fields).
         if (!chatToolOnly) {
             try {
-                const extra = this.client.usingTryItKey
-                    ? AlexaAI._browserImageFields(aspectRatio || '1:1', apiFields)
-                    : apiFields;
-                const data = await this.client.text2img(text, extra, { signal });
+                const browserFields = AlexaAI._browserImageFields(aspectRatio || '1:1', apiFields);
+                const extra = this.client.usingTryItKey ? browserFields : apiFields;
+                const data = await this.client.text2img(text, extra, {
+                    signal,
+                    // used when a registered key is refused and runApi()
+                    // retries anonymously
+                    anonymousExtraFields: browserFields,
+                });
                 const url = AlexaAI._outputUrl(data);
                 if (url) return { ok: true, url, id: data.id || null, error: null, via: 'api', raw: data };
                 errors.push('text2img: no output_url in response');
@@ -784,7 +788,7 @@ class AlexaAI {
         if (!field) return { ...AlexaAI._mediaError('detectNsfw', 'NSFW_FAILED'), score: null, nsfw: null };
         const threshold = typeof opts.threshold === 'number' ? opts.threshold : 0.7;
         try {
-            const data = await this.client.detectNsfw(field);
+            const data = await this.client.detectNsfw(field, {}, opts);
             const score = typeof data?.output?.nsfw_score === 'number' ? data.output.nsfw_score : null;
             return { ok: true, score, nsfw: score == null ? null : score >= threshold, error: null, raw: data };
         } catch (err) {

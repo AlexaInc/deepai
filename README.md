@@ -894,6 +894,20 @@ github.com/lexiforest/curl-impersonate/releases). Quota and auth errors are
 never re-driven through other transports. Run `node examples/diagnose.js` to
 see which transport your network accepts.
 
+**`anonymousApiFallback` (2.4.0).** Every `/api/*` helper — `generateImage`,
+`editImage`, `upscaleImage`, `colorizeImage`, `detectNsfw`, `summarizeText`
+and plain `deepai.runApi()` — automatically retries once with a fresh
+anonymous key (browser dialect per endpoint) when the registered key is
+refused with "Pro members in good standing". This is what the website does
+for free visitors, so all of these now work on free keys from a residential
+IP. Disable globally with `anonymousApiFallback: false` in the constructor.
+On failure both refusals are reported (`<registered refusal> | anonymous
+retry: <anonymous refusal>`).
+
+**Windows consoles.** CLI output from the bundled examples is plain ASCII on
+purpose — emoji and typographic dashes render as garbage (Chinese-looking
+mojibake) in cmd.exe/PowerShell with a non-UTF-8 codepage.
+
 **`generateImage()` returns `{ ok: false, error: 'DEEPAI_QUOTA_EXCEEDED' }`**
 `/api/text2img` is Pro-only for registered keys ("APIs are only available for
 Pro members in good standing"), the anonymous browser-shaped retry was

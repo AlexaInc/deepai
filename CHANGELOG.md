@@ -4,6 +4,29 @@ All notable changes to `alexa-ai` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.4.0] — 2026-09-07
+
+### Fixed
+- **`detectNsfw()` (and every other `/api/*` helper) now works on free keys.**
+  A registered key refused with "Pro members in good standing" gets one
+  anonymous browser-dialect retry (`anonymousApiFallback`, on by default) —
+  the same mechanism that made `generateImage()` work. Applies to
+  `generateImage`, `editImage`, `upscaleImage`, `colorizeImage`,
+  `detectNsfw`, `summarizeText` and `deepai.runApi()`.
+- `detectNsfw()` dropped its `opts` argument instead of passing it through.
+- CLI output of the bundled examples is plain ASCII now — emoji and
+  typographic dashes rendered as mojibake in Windows consoles with a
+  non-UTF-8 codepage.
+- When both the registered and the anonymous attempt fail, the error message
+  reports both refusals.
+
+### Changed
+- `generateImage()` route 1 carries the browser fields into its built-in
+  anonymous retry, so a Pro refusal recovers directly with `via: 'api'`.
+- Client media helpers accept an `options` argument (third/fourth parameter)
+  and default their anonymous dialect per endpoint (`generation_source=img`
+  for model pages; none for image-editor/torch-srgan, matching the site).
+
 ## [2.3.0] — 2026-09-07
 
 ### Added
