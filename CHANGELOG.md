@@ -4,6 +4,57 @@ All notable changes to `alexa-ai` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] — 2026-09-07
+
+### Fixed
+- **Image generation works on free keys again.** Verified against the live
+  site and three independent 2026 clients, three server-side changes had
+  silently broken the free routes; all three are now handled:
+  - **Anonymous `tryit-…` keys are hash-validated.** `generateTryItKey()`
+    used to return random digits + random hex, which the server rejects like
+    any unknown key — after a quota rotation (`autoKeyRotation`) every
+    request failed. Keys are now minted with the site's own protocol
+    (`tryit-{rand}-{md5rev(ua+md5rev(ua+md5rev(ua+rand+SALT)))}`), hashed
+    over the configured `userAgent` so the key and the request match. The
+    salt rotates server-side, so `DeepAIClient.discoverTryItSalt()` reads it
+    from the inline JS of the `/chat` page (memoised for an hour, warmed by
+    `init()`); the newest known salt is the fallback and `tryitSalt` pins it
+    manually. Known salts: `hackers_become_a_little_stinkier_every_time_they_hack`
+    (2026-09), `suditya_is_a_smelly_hacker` (older).
+  - **`/api/text2img` serves free keys only with the browser fields.**
+    A bare `{ text }` post answers `{"status": "Out of API credits"}`;
+    carrying `generation_source: 'chat'` (+ `width`, `height`,
+    `image_generator_version: 'hd'`, `quality`) bills the free chat quota
+    instead. `generateImage()` now sends those fields by default
+    (constructor option `imageApiFields`, `false` restores the bare post),
+    maps `aspectRatio` to dimensions, and retries once bare if a strict
+    backend dislikes the extras.
+  - **The in-chat image tool's packet no longer carries a url** — only
+    `{type:'generated_image', prompt}`. The engine now completes the
+    generation itself with an `/api/text2img` post carrying the tool's
+    prompt (`via: 'chat-api'`), exactly like the browser, and falls back to
+    one natural-language image turn ("Create image: …") before giving up.
+    A quota refusal now short-circuits the remaining turns instead of
+    burning them.
+- **Attachment uploads no longer send the `api-key` header.**
+  `/chat_attachments/upload` refuses it; the call is now anonymous with the
+  `Origin` header (as the browser sends it). Previously every
+  image/document message failed at the upload step, so vision and document
+  reading never got a chance to run.
+
+### Added
+- `npm run test:live` (`test/live-api.js`) — a live verification matrix for
+  any host that can reach api.deepai.org: salt discovery, minted-key chat,
+  the refused bare text2img post, the browser-field post, `generateImage()`
+  end-to-end on both key kinds, sentiment/summarization, and the anonymous
+  upload. Distinguishes "host cannot reach DeepAI" from real API failures.
+- `.env.example` documenting `DEEPAI_API_KEY`, `DEEPAI_API_KEYS`,
+  `POSTGRES_URL` and `OCR_API_KEY`.
+- Offline assertions grew from 392 to 487: the tryit hash fixtures (verified
+  against the site's own minified minting code), salt scraping (both observed
+  page shapes), salt discovery plumbing, anonymous-upload headers, the free
+  text2img route, and the prompt-only tool-packet completion.
+
 ## [2.1.2] — 2026-09-06
 
 ### Changed

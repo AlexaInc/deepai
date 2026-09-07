@@ -1,5 +1,7 @@
 'use strict';
 
+const { createHash } = require('crypto');
+
 const StreamParser = require('./StreamParser');
 const { STANDARD_APIS, TASK_TYPES } = require('./Endpoints');
 const { DeepAIError, QuotaExceededError } = require('./errors');
@@ -42,6 +44,8 @@ class DeepAIClient {
         this._keys = [...config.keys];
         this._keyIndex = 0;
         this.sessionUuid = DeepAIClient.uuid();
+        this._discoveredSalt = null; // { value, at } once /chat has been parsed
+        this._saltProbeStarted = false;
 
         if (typeof fetch !== 'function') {
             throw new DeepAIError(
@@ -71,7 +75,7 @@ class DeepAIClient {
             return true;
         }
         if (this.config.autoKeyRotation) {
-            const fresh = DeepAIClient.generateTryItKey();
+            const fresh = this.mintTryItKey();
             this._keys.push(fresh);
             this._keyIndex = this._keys.length - 1;
             if (this.config.debug) this.log.warn?.('[AlexaAI] Minted a fresh anonymous DeepAI key');
@@ -81,13 +85,110 @@ class DeepAIClient {
     }
 
     /**
-     * Anonymous "try it" key in the shape deepai.org generates in-browser:
-     * `tryit-<10 digits>-<32 hex>`.
+     * Anonymous "try it" key in the shape — and the *hash protocol* —
+     * deepai.org's browser client uses. The server verifies the hash chain,
+     * so a random `tryit-<digits>-<hex>` string is rejected exactly like an
+     * unknown key. Live formula (verified against the minified site code and
+     * three independent 2026 clients):
+     *
+     *   rand = String(Math.round(Math.random() * 100000000000))
+     *   h(s) = md5hex(s) reversed
+     *   key  = `tryit-${rand}-${h(ua + h(ua + h(ua + rand + SALT)))}`
+     *
+     * The salt lives in the inline JS of the /chat page and rotates
+     * server-side; known salts are tried newest-first and
+     * `discoverTryItSalt()` keeps the list fresh at runtime. The key is only
+     * valid for the user agent it was hashed with — pass the SAME user agent
+     * the requests will send (Config already does this for `mintTryItKey`).
+     *
+     * @param {string} [userAgent] must be the UA the requests will send
+     * @param {string} [salt]      current site salt (default: newest known)
+     * @param {string} [rand]      the random middle part (tests only)
      */
-    static generateTryItKey() {
-        const digits = Array.from({ length: 10 }, () => Math.floor(Math.random() * 10)).join('');
-        const hex = Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
-        return `tryit-${digits}-${hex}`;
+    static generateTryItKey(userAgent = 'Mozilla/5.0', salt = DeepAIClient.TRYIT_SALTS[0], rand = String(Math.round(Math.random() * 100000000000))) {
+        const rev = (s) => createHash('md5').update(String(s), 'utf8').digest('hex').split('').reverse().join('');
+        return `tryit-${rand}-${rev(userAgent + rev(userAgent + rev(userAgent + rand + salt)))}`;
+    }
+
+    /** Salts the /chat page has used for the anonymous-key hash chain. */
+    static get TRYIT_SALTS() {
+        return ['hackers_become_a_little_stinkier_every_time_they_hack', 'suditya_is_a_smelly_hacker'];
+    }
+
+    /** The salt used when minting keys: caller override > discovered > newest known. */
+    get tryItSalt() {
+        if (typeof this.config.tryitSalt === 'string' && this.config.tryitSalt) return this.config.tryitSalt;
+        if (this._discoveredSalt && Date.now() - this._discoveredSalt.at < DeepAIClient.SALT_TTL_MS) {
+            return this._discoveredSalt.value;
+        }
+        return DeepAIClient.TRYIT_SALTS[0];
+    }
+
+    /**
+     * Fetch `/chat` and read the salt out of the inline key-minting script.
+     * DeepAI rotates the string every so often; when the regex no longer
+     * matches we keep the newest known salt, so this failing is never fatal.
+     * Memoized for an hour.
+     * @returns {Promise<string|null>} the discovered salt, or null
+     */
+    async discoverTryItSalt({ force = false, signal = null } = {}) {
+        if (!force && this._discoveredSalt && Date.now() - this._discoveredSalt.at < DeepAIClient.SALT_TTL_MS) {
+            return this._discoveredSalt.value;
+        }
+        try {
+            const response = await fetch(`${this.config.origin}/chat`, {
+                headers: {
+                    'User-Agent': this.config.userAgent,
+                    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    Referer: `${this.config.origin}/`,
+                },
+                signal,
+            });
+            const html = await response.text();
+            const salt = DeepAIClient._extractTryItSalt(html);
+            if (salt) {
+                this._discoveredSalt = { value: salt, at: Date.now() };
+                if (this.config.debug) this.log.debug?.(`[AlexaAI] Discovered DeepAI tryit salt: ${salt}`);
+                return salt;
+            }
+        } catch {
+            /* offline or blocked — the known salts still work until rotated */
+        }
+        return null;
+    }
+
+    /** @private pull the salt out of the page source (two shapes observed). */
+    static _extractTryItSalt(html) {
+        const source = String(html ?? '');
+        // Shape 1 (2026): the inline script contains the exact chain
+        //   const tryitApiKey='tryit-'+myrandomstr+'-'+myhashfunction(...(userAgent+myrandomstr+'SALT')));
+        const tail = source.split("const tryitApiKey='tryit")[1];
+        if (tail) {
+            const inner = tail.split("t+myrandomstr+'")[1] || tail.split("t + myrandomstr + '")[1];
+            if (inner) {
+                const salt = inner.split("'")[0];
+                if (DeepAIClient._looksLikeSalt(salt)) return salt;
+            }
+        }
+        // Shape 2: same chain without the named variable.
+        const match = source.match(/myrandomstr\s*\+\s*['"]([A-Za-z0-9_. -]{8,120})['"]/);
+        if (match && DeepAIClient._looksLikeSalt(match[1])) return match[1];
+        return null;
+    }
+
+    /** @private a salt is a readable sentence-ish token, not code or html. */
+    static _looksLikeSalt(value) {
+        return typeof value === 'string' && /^[A-Za-z0-9_ -]{8,120}$/.test(value) && /[a-z]/.test(value) && !/<|>|\{|\}/.test(value);
+    }
+
+    /** Mint a key with this client's user agent and the best known salt. */
+    mintTryItKey() {
+        // Fire-and-forget: next mint (an hour from now) uses the live salt.
+        if (!this.config.tryitSalt && !this._discoveredSalt && !this._saltProbeStarted) {
+            this._saltProbeStarted = true;
+            this.discoverTryItSalt().catch(() => {});
+        }
+        return DeepAIClient.generateTryItKey(this.config.userAgent, this.tryItSalt);
     }
 
     /** Browser-identical headers. DeepAI rejects requests without an origin. */
@@ -387,6 +488,12 @@ class DeepAIClient {
 
     /**
      * Upload a file so it can be referenced by `attachment_uuids`.
+     *
+     * The upload route is the one DeepAI endpoint that must be called
+     * WITHOUT the `api-key` header — with it the server refuses the upload
+     * (exactly what the browser client avoids: it strips the header and
+     * relies on `Origin` alone).
+     *
      * @param {Buffer|Uint8Array} buffer
      * @param {string} [filename]
      * @param {string} [mimetype]
@@ -400,6 +507,7 @@ class DeepAIClient {
             method: 'POST',
             body: form,
             errorCode: 'UPLOAD_FAILED',
+            apiKeyHeader: false, // rejected when present — anonymous + Origin works
         });
         if (!data.success || !data.attachment) {
             throw new DeepAIError(data.error || 'Attachment upload failed', {
@@ -607,16 +715,18 @@ class DeepAIClient {
     // =====================================================================
 
     /** @private JSON request with uniform timeout + error handling. */
-    async _json(url, { method = 'GET', body = null, headers = {}, signal = null, errorCode = null } = {}) {
+    async _json(url, { method = 'GET', body = null, headers = {}, signal = null, errorCode = null, apiKeyHeader = true } = {}) {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), this.config.timeout);
         const linked = DeepAIClient._linkSignals(controller, signal);
 
         try {
+            const allHeaders = this.headers(headers);
+            if (!apiKeyHeader) delete allHeaders['api-key'];
             const response = await fetch(url, {
                 method,
                 body,
-                headers: this.headers(headers),
+                headers: allHeaders,
                 signal: linked,
             });
             const text = await response.text();
@@ -785,5 +895,8 @@ class DeepAIClient {
         return DeepAIClient.sleep(ms);
     }
 }
+
+/** How long a discovered tryit salt stays fresh. */
+DeepAIClient.SALT_TTL_MS = 60 * 60 * 1000;
 
 module.exports = DeepAIClient;

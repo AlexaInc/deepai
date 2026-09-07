@@ -17,12 +17,21 @@ class Config {
      * @param {object} options
      * @param {string} options.key                 DeepAI api-key (tryit-... or account key)
      * @param {string[]} [options.keys]            Extra keys to rotate through on quota errors
+     * @param {boolean} [options.autoKeyRotation]  Mint a fresh protocol-valid anonymous key
+     *                                              when every configured key is spent
+     * @param {string} [options.tryitSalt]         Pin the anonymous-key salt (default:
+     *                                              discovered from the /chat page)
+     * @param {object|false} [options.imageApiFields] Extra /api/text2img fields that unlock
+     *                                              the free route (generation_source=chat…);
+     *                                              false restores the bare { text } post
      * @param {string} options.postgresUrl         PostgreSQL connection string
      * @param {string} [options.model]             DeepAI model id
      * @param {string[]} [options.fallbackModels]  Tried in order when the main model is refused
      * @param {string} [options.visionModel]       Model used when images are attached
      * @param {string[]} [options.visionModels]    Vision fallback chain
      * @param {string} [options.imageModel]        Model used by generateImage()
+     * @param {string} [options.userAgent]         Sent on every request; minted tryit keys
+     *                                              are hashed over it, so keep them in sync
      * @param {string} [options.assistantName]     Persona name (default 'Alexa')
      * @param {string} [options.creator]           Persona creator (default 'Hansaka')
      * @param {string} [options.systemPrompt]      Override the whole persona text
@@ -106,6 +115,30 @@ class Config {
             'standard',
         ]);
         this.imageModel = opts.imageModel || 'text2img';
+
+        // ---- Free-tier image generation -------------------------------------
+        // /api/text2img refuses a bare { text } post on anonymous tryit keys
+        // ("Out of API credits") but serves the very same key when the post
+        // carries the fields the browser sends — `generation_source: 'chat'`
+        // charges the free chat quota instead of API credits. Caller-supplied
+        // fields win; `imageApiFields: false` disables the behaviour.
+        this.imageApiFields =
+            opts.imageApiFields === false
+                ? {}
+                : {
+                      generation_source: 'chat',
+                      width: '640',
+                      height: '640',
+                      image_generator_version: 'hd',
+                      quality: 'true',
+                      use_old_model: 'false',
+                      ...(opts.imageApiFields || {}),
+                  };
+
+        // Salt behind the anonymous tryit-key hash chain. The live value is
+        // scraped from the /chat page at runtime (DeepAIClient.discoverTryItSalt);
+        // this option pins it manually instead.
+        this.tryitSalt = typeof opts.tryitSalt === 'string' && opts.tryitSalt ? opts.tryitSalt : null;
 
         // ---- Engine web search (searchWeb) ----------------------------------
         // The engine searches first and hands real results to the model, so

@@ -45,8 +45,10 @@ await sock.sendMessage(jid, { text });          // your WhatsApp layer
 - **The whole DeepAI surface.** Chat, attachments, reasoning tasks, sessions,
   account settings and the classic `/api/*` family — text-to-image, upscaling,
   editing, colourising, NSFW detection, summarisation — from one client.
-- **Works on free keys.** Image generation, summarisation and image reading
-  fall back to routes that work on anonymous `tryit-…` keys.
+- **Works on free keys — and can mint its own.** Image generation,
+  summarisation and image reading run on anonymous `tryit-…` keys, and the
+  engine mints protocol-valid anonymous keys itself (the site's hash chain,
+  salt auto-discovered from `/chat`).
 - **WhatsApp-native output.** Markdown is converted to WhatsApp formatting,
   long replies are chunked, and DeepAI's wire packets never reach the user.
 - **A persona you can rely on.** Deterministic command triggers, an identity
@@ -87,7 +89,7 @@ await sock.sendMessage(jid, { text });          // your WhatsApp layer
 | --- | --- |
 | **Node.js** | 18 or newer — the engine uses the built-in `fetch`, `FormData` and `Blob` |
 | **PostgreSQL** | 12 or newer, local or managed (Supabase, Neon, Railway, Heroku…) |
-| **DeepAI key** | an anonymous `tryit-…` key is enough for chat, memory, OCR and image generation; a paid key additionally unlocks native vision and the `/api/*` endpoints |
+| **DeepAI key** | any key works: an anonymous `tryit-…` key covers chat, memory, OCR and image generation (the engine can even mint fresh ones — `autoKeyRotation`); a paid account key additionally unlocks native vision and straightforward `/api/*` credit billing |
 
 ---
 
@@ -572,6 +574,14 @@ new AlexaAI({
     visionModels: [...],           // full vision fallback chain
     keys: ['tryit-a', 'tryit-b'],  // rotated automatically on "try it exceeded"
     autoKeyRotation: false,        // mint a fresh anonymous key when every key is spent
+                                   // (protocol-valid: hashed over userAgent with the live salt)
+    tryitSalt: null,               // pin the anonymous-key salt (default: auto-discovered
+                                   // from the /chat page, newest known salt as fallback)
+    imageApiFields: { generation_source: 'chat', width: '640', height: '640',
+                      image_generator_version: 'hd', quality: 'true' },
+                                   // browser fields that unlock /api/text2img on free
+                                   // keys; false restores the bare { text } post
+    userAgent: 'Mozilla/5.0 …',    // must match the UA your tryit keys were hashed with
     webAccess: false,              // DeepAI web search on every turn
     thinkingSupport: false,        // asynchronous reasoning path
     serverMemory: false,           // DeepAI's own /chat_memory profile
@@ -780,6 +790,25 @@ The body is streamed UTF-8 text with out-of-band packets embedded in it.
   use genius"}`, `{"status": "Out of API credits"}` — often with **HTTP 200**.
   The client treats these as errors; quota refusals rotate to the next
   configured key before the model chain is tried.
+- **Anonymous `tryit-` keys are hash-validated.** The browser computes
+  `tryit-{rand}-{md5rev(ua+md5rev(ua+md5rev(ua+rand+SALT)))}` with a salt that
+  lives in the inline JS of the `/chat` page and rotates server-side; a random
+  `tryit-…`-shaped string is rejected. `DeepAIClient.generateTryItKey()`
+  implements the chain and `discoverTryItSalt()` keeps the salt current
+  (2026-09: `hackers_become_a_little_stinkier_every_time_they_hack`, older:
+  `suditya_is_a_smelly_hacker`). A key is only valid for the user agent it was
+  hashed with, so minted keys always use the engine's configured `userAgent`.
+- **`/api/text2img` has a free route.** A bare `{ text }` post is billed
+  against API credits (free keys: "Out of API credits"), but the same key is
+  served from the free chat quota when the post carries the browser fields —
+  `generation_source: 'chat'` plus `width`, `height`,
+  `image_generator_version`, `quality` (2026-09 values: `hd`, `true`,
+  640×640). `generateImage()` sends them by default; `imageApiFields: false`
+  restores the bare post.
+- **The in-chat image tool no longer returns a url.** Its packet is
+  `{type:'generated_image', prompt}` and the client completes the generation
+  itself with an `/api/text2img` post carrying that prompt — the engine does
+  the same (`via: 'chat-api'` in the result).
 - **`role: "system"` is ignored** by the chat endpoint. The persona is
   therefore delivered as a priming user/assistant pair, which the API does
   honour; a short system digest is sent as well for backends that respect it.
@@ -842,9 +871,29 @@ error), and the reply came from DeepAI's own web access. Point
 blocked where the bot runs.
 
 **`generateImage()` returns `{ ok: false, error: 'DEEPAI_QUOTA_EXCEEDED' }`**
-Both routes were refused: `/api/text2img` needs credits and the in-chat image
-tool hit the key's chat quota. Add more keys (`keys: [...]`) or wait for the
-quota to reset. `message` carries DeepAI's exact wording.
+Fixed in 2.2.0 — this used to be the normal outcome on free keys. Three
+things had changed on DeepAI's side and are now handled:
+
+- `tryit-…` keys are **hash-validated**. The engine used to mint random
+  `tryit-<digits>-<hex>` strings, which the server rejects like any unknown
+  key. Keys are now produced with the site's own protocol —
+  `tryit-{rand}-{md5rev(ua+md5rev(ua+md5rev(ua+rand+SALT)))}` — with the salt
+  scraped from the `/chat` page at runtime (`discoverTryItSalt()`), falling
+  back to the newest known salt when the page is unreachable.
+- `/api/text2img` answers "Out of API credits" for a bare `{ text }` post on
+  free keys, but serves the same key when the post carries the browser fields
+  (`generation_source: 'chat'`, `width`, `height`, `image_generator_version`,
+  `quality`). Those fields are now sent by default (`imageApiFields`).
+- The in-chat tool's reply packet stopped carrying a url: it now contains
+  only `{type:'generated_image', prompt}` and the *client* completes the
+  generation on `/api/text2img`. The engine does the same, then falls back to
+  one natural-language image turn before giving up.
+
+If it still fails, run `npm run test:live` (see [Testing](#testing)) — it
+tells you exactly which of the three routes answers on your host and key. A
+genuine `DEEPAI_QUOTA_EXCEEDED` now means the key's chat quota itself is
+spent: add more `keys: [...]`, enable `autoKeyRotation`, or wait for the
+reset. `message` always carries DeepAI's exact wording.
 
 **Photos are answered with "I can't view images right now"**
 Native vision needs a paid DeepAI key; on a free key only text inside the
@@ -892,7 +941,13 @@ POSTGRES_URL=... DEEPAI_KEY=tryit-... node test/run-tests.js   # + live DeepAI
   including both ways DeepAI reports web-search sources — plus alias and
   unseen-row cases on a real database when `POSTGRES_URL` is set.
 
-392 assertions run offline; 458 with a database.
+487 assertions run offline; 553 with a database.
+
+```bash
+# live API verification (needs a host that can reach api.deepai.org):
+DEEPAI_KEY=your-account-key npm run test:live      # account-key matrix
+npm run test:live -- --tryit                       # minted free-key matrix
+```
 
 ---
 

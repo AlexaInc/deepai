@@ -1,10 +1,11 @@
 {
   "name": "alexa-ai",
-  "version": "2.1.2",
+  "version": "2.2.0",
   "description": "AI engine for the Alexa WhatsApp bot: DeepAI-powered chat with PostgreSQL-backed long-term memory, cross-chat identity (@lid <-> phone), vision/OCR, image generation and web search.",
   "main": "index.js",
   "scripts": {
     "test": "node test/run-tests.js && node test/wrapper-methods.js",
+    "test:live": "node test/live-api.js",
     "demo": "node examples/demo.js",
     "migrate": "node -e \"require('./index').AlexaAI.migrate(process.env.POSTGRES_URL).then(()=>{console.log('migrated');process.exit(0)}).catch(e=>{console.error(e);process.exit(1)})\"",
     "test:wrapper": "node test/wrapper-methods.js"

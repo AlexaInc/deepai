@@ -117,6 +117,9 @@ class AlexaAI {
     /** Open the pool and run migrations. Optional — `chat()` does it lazily. */
     async init() {
         await this.db.connect();
+        // Warm the anonymous-key salt so the first minted tryit key already
+        // matches the live site (never fatal when unreachable).
+        this.client.discoverTryItSalt().catch(() => {});
         return this;
     }
 
@@ -596,15 +599,22 @@ class AlexaAI {
     /**
      * Text-to-image.
      *
-     * Two routes, tried in order:
+     * Three routes, tried in order:
      *
-     *   1. `POST /api/text2img` — the classic public API. Fast and returns a
-     *      plain `output_url`, but it is a PAID endpoint: anonymous `tryit-…`
-     *      keys get `{"status": "Out of API credits"}` / "try it exceeded".
-     *   2. The in-chat image tool — the same `generate_image` function call the
-     *      deepai.org web client sends when you press "Create image". This
-     *      works on free chat keys and answers with a `generated_image` packet
-     *      carrying a `share_url`.
+     *   1. `POST /api/text2img` — the classic public API, now sent with the
+     *      browser-parity fields (`generation_source: 'chat'`, `width`,
+     *      `height`, `image_generator_version`, `quality`), which is what
+     *      makes the endpoint serve anonymous `tryit-…` keys from the free
+     *      chat quota instead of answering "Out of API credits". Account
+     *      keys work here too (credits are charged as usual).
+     *   2. The in-chat image tool — the `generate_image` function call the
+     *      deepai.org web client sends when you press "Create image". Since
+     *      2026 the reply packet carries only `{type:'generated_image',
+     *      prompt}` with NO url, so the engine completes the generation with
+     *      a `/api/text2img` post of its own — exactly like the browser.
+     *   3. A plain-language image request — the tool also fires when the
+     *      model simply decides to draw, so one natural-language turn is
+     *      tried before giving up.
      *
      * Either way the result is normalised to `{ ok, url, id, error, via }`.
      * Every failure is returned, never thrown, so a bot command can simply
@@ -612,11 +622,11 @@ class AlexaAI {
      *
      * @param {string} prompt
      * @param {object} [opts]
-     * @param {string} [opts.aspectRatio='1:1']   in-chat tool only ('1:1', '16:9', '9:16'…)
-     * @param {number} [opts.width] / [opts.height]  /api/text2img only
+     * @param {string} [opts.aspectRatio='1:1']   '1:1', '16:9', '9:16', '4:3', '3:4'
+     * @param {number} [opts.width] / [opts.height]  /api/text2img only (128–1536)
      * @param {string} [opts.image_generator_version]  /api/text2img only
      * @param {boolean} [opts.chatToolOnly]     skip /api/text2img
-     * @param {boolean} [opts.apiOnly]          skip the in-chat tool
+     * @param {boolean} [opts.apiOnly]          skip the in-chat routes
      * @param {AbortSignal} [opts.signal]
      * @returns {Promise<{ok:boolean, url:string|null, id:string|null, error:string|null, message?:string, via:string|null, raw?:any}>}
      */
@@ -628,10 +638,11 @@ class AlexaAI {
         const { aspectRatio, chatToolOnly, apiOnly, signal, ...apiFields } = opts || {};
         const errors = [];
 
-        // ---- 1. classic /api/text2img -------------------------------------
+        // ---- 1. classic /api/text2img (browser-parity fields) ---------------
         if (!chatToolOnly) {
+            const fields = AlexaAI._imageApiFields(apiFields, aspectRatio, this.config.imageApiFields);
             try {
-                const data = await this.client.text2img(text, apiFields, { signal });
+                const data = await this.client.text2img(text, fields, { signal });
                 const url = AlexaAI._outputUrl(data);
                 if (url) return { ok: true, url, id: data.id || null, error: null, via: 'api', raw: data };
                 errors.push('text2img: no output_url in response');
@@ -640,23 +651,60 @@ class AlexaAI {
                 if (err.code === 'ABORTED') {
                     return { ok: false, url: null, id: null, error: 'ABORTED', message: err.message, via: null };
                 }
+                // Some strict backends may dislike the extra fields — one
+                // bare, documented-shape retry before moving on. A quota
+                // refusal is about the key, not the field set: skip it.
+                if (!(err instanceof QuotaExceededError) && Object.keys(fields).length > 1) {
+                    try {
+                        const data = await this.client.text2img(text, {}, { signal });
+                        const url = AlexaAI._outputUrl(data);
+                        if (url) return { ok: true, url, id: data.id || null, error: null, via: 'api', raw: data };
+                        errors.push('text2img (bare): no output_url in response');
+                    } catch (err2) {
+                        errors.push(`text2img (bare): ${err2.message}`);
+                    }
+                }
             }
         }
 
         // ---- 2. the chat image tool (works on free chat keys) ---------------
         if (!apiOnly) {
-            try {
-                const answer = await this.client.chatDetailed(
-                    [{ role: 'user', content: StreamParser.imageToolPayload(text, aspectRatio || '1:1') }],
-                    { signal, extraFields: { image_generation: 'true' } }
-                );
-                const url = answer.images?.[0] || AlexaAI._outputUrl(answer.payload);
-                if (url) {
-                    return { ok: true, url, id: answer.payload?.id || null, error: null, via: 'chat', raw: answer.payload };
+            const toolTurns = [
+                { label: 'chat tool', content: StreamParser.imageToolPayload(text, aspectRatio || '1:1') },
+                { label: 'chat prompt', content: `Create an image: ${text}` },
+            ];
+            for (const turn of toolTurns) {
+                try {
+                    const answer = await this.client.chatDetailed([{ role: 'user', content: turn.content }], {
+                        signal,
+                        extraFields: { image_generation: 'true' },
+                    });
+                    const url = answer.images?.[0] || AlexaAI._outputUrl(answer.payload);
+                    if (url) {
+                        return { ok: true, url, id: answer.payload?.id || null, error: null, via: 'chat', raw: answer.payload };
+                    }
+
+                    // 2026 wire shape: the tool "ran" but the packet carries
+                    // only the prompt — complete it ourselves, like the site.
+                    const toolPrompt = AlexaAI._toolImagePrompt(answer);
+                    if (toolPrompt) {
+                        try {
+                            const data = await this.client.text2img(toolPrompt, AlexaAI._imageApiFields({}, null, this.config.imageApiFields), { signal });
+                            const url = AlexaAI._outputUrl(data);
+                            if (url) return { ok: true, url, id: data.id || null, error: null, via: 'chat-api', raw: data };
+                            errors.push(`${turn.label}: completion had no output_url`);
+                        } catch (err) {
+                            errors.push(`${turn.label} completion: ${err.message}`);
+                        }
+                    } else {
+                        errors.push(`${turn.label}: no image in reply (${String(answer.text || '').slice(0, 80)})`);
+                    }
+                } catch (err) {
+                    errors.push(`${turn.label}: ${err.message}`);
+                    // Every key already refused during this turn — the next
+                    // turn cannot succeed either.
+                    if (err instanceof QuotaExceededError || err.code === 'ABORTED') break;
                 }
-                errors.push(`chat tool: no image in reply (${String(answer.text || '').slice(0, 80)})`);
-            } catch (err) {
-                errors.push(`chat tool: ${err.message}`);
             }
         }
 
@@ -670,6 +718,46 @@ class AlexaAI {
             message,
             via: null,
         };
+    }
+
+    /**
+     * @private Merge the browser-parity /api/text2img fields with the
+     * caller's own (caller wins) and map `aspectRatio` to width/height when
+     * the caller did not give explicit dimensions. A per-call aspect ratio
+     * overrides the configured default dimensions; explicit caller
+     * width/height always win over everything.
+     */
+    static _imageApiFields(apiFields = {}, aspectRatio = null, defaults = {}) {
+        const merged = { ...defaults, ...apiFields };
+        if (aspectRatio && apiFields.width === undefined && apiFields.height === undefined) {
+            const map = { '1:1': [640, 640], '16:9': [1024, 576], '9:16': [576, 1024], '4:3': [896, 672], '3:4': [672, 896] };
+            const size = map[String(aspectRatio)];
+            if (size) {
+                merged.width = String(size[0]);
+                merged.height = String(size[1]);
+            }
+        }
+        return merged;
+    }
+
+    /**
+     * @private The prompt the image tool decided to draw, when the reply
+     * packet proves the tool ran: `{type:'generated_image', prompt}` or a
+     * `generate_image` function call carrying arguments. Null when the model
+     * only wrote text (nothing to complete).
+     */
+    static _toolImagePrompt(answer) {
+        const payload = answer?.payload;
+        if (!payload || Array.isArray(payload)) return null;
+        if (payload.type === 'generated_image' && !payload.share_url && !payload.url && !payload.output_url) {
+            return typeof payload.prompt === 'string' && payload.prompt.trim() ? payload.prompt : null;
+        }
+        const call = answer.functionCall || payload.function_call;
+        if (call?.name === 'generate_image') {
+            const prompt = typeof call.arguments === 'object' ? call.arguments?.prompt : null;
+            if (typeof prompt === 'string' && prompt.trim()) return prompt;
+        }
+        return null;
     }
 
     /**

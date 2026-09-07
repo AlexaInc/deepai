@@ -532,6 +532,10 @@ section('DeepAIClient — the whole endpoint surface (mocked transport)');
 
         if (String(url).includes('/hacking_is_a_serious_crime')) return respond('Hi Nimal!');
         if (String(url).includes('/chat_attachments/upload')) {
+            // Live behaviour: the upload route refuses the api-key header.
+            if (init.headers && init.headers['api-key']) {
+                return respond(JSON.stringify({ error: 'The api-key header is not permitted on this route' }), 400);
+            }
             return respond(JSON.stringify({ success: true, attachment: { uuid: 'u-1', extraction_status: 'complete' } }));
         }
         if (String(url).includes('/chat_attachments/get')) {
@@ -571,6 +575,9 @@ section('DeepAIClient — the whole endpoint surface (mocked transport)');
 
         const attachment = await client.uploadAttachment(Buffer.from('hello'), 'a.txt', 'text/plain');
         check('uploads attachments', attachment.uuid, 'u-1');
+        const uploadCall = calls.find((c) => c.url.includes('chat_attachments/upload'));
+        check('upload is anonymous — no api-key header', uploadCall.headers['api-key'], undefined);
+        check('upload still carries Origin', uploadCall.headers.Origin, 'https://deepai.org');
         const fetched = await client.getAttachment('u-1');
         check('reads attachment extraction status', fetched.extraction_status, 'complete');
 
@@ -626,10 +633,68 @@ section('DeepAIClient — the whole endpoint surface (mocked transport)');
     })();
 }
 {
+    // Fixtures were produced by the site's own (minified) minting code:
+    //   rand = String(Math.round(Math.random() * 1e11))
+    //   h(s) = md5hex(s) reversed
+    //   key  = `tryit-${rand}-${h(ua + h(ua + h(ua + rand + SALT)))}`
+    const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36';
     ok(
         'anonymous key generator matches the deepai.org shape',
-        /^tryit-\d{10}-[0-9a-f]{32}$/.test(DeepAIClient.generateTryItKey())
+        /^tryit-\d{1,11}-[0-9a-f]{32}$/.test(DeepAIClient.generateTryItKey())
     );
+    check(
+        'key hash chain (2026 salt, site-verified fixture)',
+        DeepAIClient.generateTryItKey(UA, 'hackers_become_a_little_stinkier_every_time_they_hack', '49999999999'),
+        'tryit-49999999999-c3dfcd0637ccb3e4469de54a800c4d80'
+    );
+    check(
+        'key hash chain (older salt still supported)',
+        DeepAIClient.generateTryItKey(UA, 'suditya_is_a_smelly_hacker', '49999999999'),
+        'tryit-49999999999-fcd9a49cadd5698f39dc4d13ee587b7e'
+    );
+    check(
+        'the key is bound to the user agent it is hashed with',
+        DeepAIClient.generateTryItKey('TestAgent/1.0', 'hackers_become_a_little_stinkier_every_time_they_hack', '49999999999'),
+        'tryit-49999999999-8b1522e091c6fab0b91f88512802f305'
+    );
+    check(
+        'salt scraper: 2026 inline script shape',
+        DeepAIClient._extractTryItSalt(
+            `<script>var myrandomstr;const tryitApiKey='tryit-'+myrandomstr+'-'+` +
+                `myhashfunction(userAgent+myhashfunction(userAgent+myhashfunction(userAgent+myrandomstr+'hackers_become_a_little_stinkier_every_time_they_hack')));</script>`
+        ),
+        'hackers_become_a_little_stinkier_every_time_they_hack'
+    );
+    check(
+        'salt scraper: unnamed-variable shape',
+        DeepAIClient._extractTryItSalt(`f(u+myrandomstr+'suditya_is_a_smelly_hacker'))`),
+        'suditya_is_a_smelly_hacker'
+    );
+    check('salt scraper: no minting script on the page', DeepAIClient._extractTryItSalt('<html><body>hello</body></html>'), null);
+
+    {
+        // The live salt is discovered from the /chat page and then used for
+        // every minted key until it changes again.
+        const cfg = new Config({ key: 'k', postgresUrl: 'postgres://u:p@localhost/db' });
+        const client = new DeepAIClient(cfg);
+        const realFetch = global.fetch;
+        global.fetch = async () => ({
+            status: 200,
+            headers: { get: () => 'text/html' },
+            text: async () => `const tryitApiKey='tryit-'+myrandomstr+'-'+myhashfunction(x+myhashfunction(x+myhashfunction(x+myrandomstr+'a_brand_new_salt_value')));`,
+            body: null,
+        });
+        const discovered = await client.discoverTryItSalt();
+        check('salt discovered from the chat page', discovered, 'a_brand_new_salt_value');
+        check('discovered salt is used for minting', client.tryItSalt, 'a_brand_new_salt_value');
+        ok('minted key keeps the protocol shape', /^tryit-\d{1,11}-[0-9a-f]{32}$/.test(client.mintTryItKey()));
+        global.fetch = realFetch;
+    }
+    {
+        // A pinned salt overrides discovery entirely.
+        const cfg = new Config({ key: 'k', postgresUrl: 'postgres://u:p@localhost/db', tryitSalt: 'my_own_salt' });
+        check('tryitSalt option pins the salt', new DeepAIClient(cfg).tryItSalt, 'my_own_salt');
+    }
     const cfg = new Config({ key: 'k', postgresUrl: 'postgres://u:p@localhost/db' });
     check('endpoint map exposes the chat route', cfg.url('chat'), 'https://api.deepai.org/hacking_is_a_serious_crime');
     check(

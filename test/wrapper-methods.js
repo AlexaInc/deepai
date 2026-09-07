@@ -71,8 +71,14 @@ function installMockDeepAI(options = {}) {
         });
 
         if (u.includes('/api/text2img')) {
+            // 2026 live behaviour: a post carrying the browser fields
+            // (generation_source=chat …) is served from the FREE chat quota on
+            // any tryit key; a bare { text } post needs API credits.
             if (options.paidText2img) {
                 return respond(JSON.stringify({ id: 'img-1', output_url: 'https://api.deepai.org/job-view-file/img-1/outputs/output.jpg' }), 200, 'application/json');
+            }
+            if (fields.generation_source === 'chat' && !options.freeImageRefused) {
+                return respond(JSON.stringify({ id: 'img-free', output_url: 'https://api.deepai.org/job-view-file/img-free/outputs/output.jpg' }), 200, 'application/json');
             }
             return respond(JSON.stringify({ status: 'Out of API credits - please top up your account' }), 200, 'application/json');
         }
@@ -86,6 +92,11 @@ function installMockDeepAI(options = {}) {
             return respond(JSON.stringify({ id: 'job-3', output: { nsfw_score: 0.03 } }), 200, 'application/json');
         }
         if (u.includes('/chat_attachments/upload')) {
+            // Live behaviour: the upload route refuses requests that carry the
+            // api-key header — it must be anonymous (Origin alone).
+            if (init.headers && init.headers['api-key']) {
+                return respond(JSON.stringify({ error: 'The api-key header is not permitted on this route' }), 400, 'application/json');
+            }
             return respond(JSON.stringify({ success: true, attachment: { uuid: 'att-1', extraction_status: 'skipped' } }), 200, 'application/json');
         }
         if (u.includes('/chat_attachments/get')) {
@@ -160,6 +171,17 @@ function installMockDeepAI(options = {}) {
             }
         }
 
+        // The /chat page the salt discovery fetches (inline minting script).
+        if (u === 'https://deepai.org/chat') {
+            return respond(
+                `<html><script>var myrandomstr;const tryitApiKey='tryit-'+myrandomstr+'-'+` +
+                    `myhashfunction(userAgent+myhashfunction(userAgent+myhashfunction(userAgent+myrandomstr+'hackers_become_a_little_stinkier_every_time_they_hack')));` +
+                    `</script></html>`,
+                200,
+                'text/html'
+            );
+        }
+
         if (u.includes('/hacking_is_a_serious_crime')) {
             const history = JSON.parse(fields.chatHistory || '[]');
             const last = history[history.length - 1]?.content || '';
@@ -181,8 +203,16 @@ function installMockDeepAI(options = {}) {
             }
 
             // In-chat image tool: the browser's generate_image function call.
+            // Since 2026 the packet may carry only a prompt — the client then
+            // completes the generation on /api/text2img itself.
             if (last.includes('"function_call"') && last.includes('generate_image')) {
+                if (options.toolPromptOnly) {
+                    return respond(`Creating your image!${FS}${JSON.stringify({ type: 'generated_image', prompt: 'a red tuk-tuk in Galle at sunset, vibrant colours' })}`);
+                }
                 return respond(`Here is your image!${FS}${JSON.stringify({ type: 'generated_image', share_url: 'https://deepai.org/generated/abc123.png' })}`);
+            }
+            if (/^Create an image:/.test(last)) {
+                return respond(`Here is your image!${FS}${JSON.stringify({ type: 'generated_image', share_url: 'https://deepai.org/generated/nl456.png' })}`);
             }
             if (fields.search === 'search' || fields.web_access_enabled === 'true') {
                 if (options.webReply) return respond(typeof options.webReply === 'function' ? options.webReply(last) : options.webReply);
@@ -296,10 +326,41 @@ async function mockedTests() {
         check('instance.version matches', ai.version, AlexaAI.version);
     }
 
-    section('generateImage() — free key: /api/text2img refused, chat tool succeeds');
+    section('generateImage() — free key: /api/text2img with the browser fields works');
     {
         const ai = new AlexaAI({ key: 'tryit-1-x', postgresUrl: 'postgres://u:p@localhost/db', autoMigrate: false, maxRetries: 0 });
         const mock = installMockDeepAI();
+        try {
+            const r = await ai.generateImage('a red tuk-tuk in Galle at sunset', { aspectRatio: '16:9' });
+            check('ok', r.ok, true);
+            check('served from the free chat quota', r.via, 'api');
+            check('url from /api/text2img', r.url.includes('img-free'), true);
+            const api = mock.calls.find((c) => c.url.includes('/api/text2img'));
+            check('prompt posted', api.fields.text, 'a red tuk-tuk in Galle at sunset');
+            check('generation_source=chat marks the free route', api.fields.generation_source, 'chat');
+            check('aspect ratio mapped to width', api.fields.width, '1024');
+            check('aspect ratio mapped to height', api.fields.height, '576');
+            check('image generator version', api.fields.image_generator_version, 'hd');
+            ok('no chat turn was needed', !mock.calls.some((c) => c.url.includes('hacking_is_a_serious_crime')));
+
+            const empty = await ai.generateImage('   ');
+            check('empty prompt is rejected, not thrown', empty.error, 'VALIDATION_ERROR');
+
+            // The pre-fix world (and callers who disable the fields): the bare
+            // post needs credits, and apiOnly then reports the quota honestly.
+            const oldStyle = new AlexaAI({ key: 'tryit-1-x', postgresUrl: 'postgres://u:p@localhost/db', autoMigrate: false, maxRetries: 0, imageApiFields: false });
+            const apiOnly = await oldStyle.generateImage('x', { apiOnly: true });
+            check('bare api post on a free key reports quota', apiOnly.error, 'DEEPAI_QUOTA_EXCEEDED');
+            ok('quota failure carries a message', /credits/i.test(apiOnly.message));
+        } finally {
+            mock.restore();
+        }
+    }
+
+    section('generateImage() — free key: API route refused, chat tool completes');
+    {
+        const ai = new AlexaAI({ key: 'tryit-1-x', postgresUrl: 'postgres://u:p@localhost/db', autoMigrate: false, maxRetries: 0 });
+        const mock = installMockDeepAI({ freeImageRefused: true });
         try {
             const r = await ai.generateImage('a red tuk-tuk in Galle at sunset');
             check('ok', r.ok, true);
@@ -314,13 +375,23 @@ async function mockedTests() {
             check('function_call name', payload.function_call.name, 'generate_image');
             check('function_call prompt', JSON.parse(payload.function_call.arguments).prompt, 'a red tuk-tuk in Galle at sunset');
             check('image_generation flag sent', tool.fields.image_generation, 'true');
+        } finally {
+            mock.restore();
+        }
+    }
 
-            const empty = await ai.generateImage('   ');
-            check('empty prompt is rejected, not thrown', empty.error, 'VALIDATION_ERROR');
-
-            const apiOnly = await ai.generateImage('x', { apiOnly: true });
-            check('apiOnly on a free key reports quota', apiOnly.error, 'DEEPAI_QUOTA_EXCEEDED');
-            ok('apiOnly failure carries a message', /credits/i.test(apiOnly.message));
+    section('generateImage() — prompt-only tool packet completed on /api/text2img');
+    {
+        const ai = new AlexaAI({ key: 'tryit-1-x', postgresUrl: 'postgres://u:p@localhost/db', autoMigrate: false, maxRetries: 0 });
+        const mock = installMockDeepAI({ toolPromptOnly: true });
+        try {
+            const r = await ai.generateImage('a red tuk-tuk in Galle at sunset', { chatToolOnly: true });
+            check('ok', r.ok, true);
+            check('completed through the api', r.via, 'chat-api');
+            check('url from the completion call', r.url.includes('img-free'), true);
+            const completions = mock.calls.filter((c) => c.url.includes('/api/text2img'));
+            check('the tool prompt was drawn, not the raw command', completions[completions.length - 1].fields.text, 'a red tuk-tuk in Galle at sunset, vibrant colours');
+            check('completion rides the free route', completions[completions.length - 1].fields.generation_source, 'chat');
         } finally {
             mock.restore();
         }
@@ -335,7 +406,7 @@ async function mockedTests() {
             check('ok', r.ok, true);
             check('route', r.via, 'api');
             ok('url from /api/text2img', r.url.includes('job-view-file'));
-            check('extra fields forwarded', mock.calls[0].fields.width, '512');
+            check('caller fields forwarded', mock.calls[0].fields.width, '512');
             check('no chat call was needed', mock.calls.filter((c) => c.url.includes('hacking')).length, 0);
         } finally {
             mock.restore();
@@ -855,6 +926,9 @@ async function mockedTests() {
             ok('description carries the OCR text', r.description.includes('Rs 4,500'));
             ok('text field is ready to send', r.text.includes('Rs 4,500'));
             ok('attachment uuid returned', r.attachmentUuids.includes('att-1'));
+            const up = mock.calls.find((c) => c.url.includes('chat_attachments/upload'));
+            check('upload is anonymous (api-key header stripped)', up.headers['api-key'], undefined);
+            check('upload still carries the Origin header', up.headers['Origin'], 'https://deepai.org');
 
             const none = await ai.describeImage(null);
             check('no image -> no_image', none.reason, 'no_image');

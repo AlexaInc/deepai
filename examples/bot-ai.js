@@ -44,14 +44,16 @@
  *
  * REQUIRED alexa-ai VERSION
  *   The extras below (generateImage, searchWeb, upscaleImage, …) exist from
- *   alexa-ai 2.0.0; the media/alias fixes from 2.1.0 and the long-form
- *   searchWeb() from 2.1.1. `getEngine()` checks
+ *   alexa-ai 2.0.0; the media/alias fixes from 2.1.0, the long-form
+ *   searchWeb() from 2.1.1, and the free-key image fixes from 2.2.0
+ *   (hash-valid anonymous keys, browser text2img fields, prompt-only tool
+ *   packets, anonymous uploads). `getEngine()` checks
  *   this at startup and throws a clear message instead of the confusing
  *   "getEngine(...).generateImage is not a function" you get from an old copy
  *   in node_modules. If you see that error:
  *
  *       npm install github:AlexaInc/deepai      # or your fork / tarball
- *       node -e "console.log(require('alexa-ai').version)"   # must print >= 2.1.1
+ *       node -e "console.log(require('alexa-ai').version)"   # must print >= 2.2.0
  *
  * REQUIRED .env
  *   DEEPAI_API_KEY=tryit-xxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx   (your DeepAI key)
@@ -72,7 +74,7 @@ const config = require("../config");
 const AlexaAI = require("alexa-ai");
 
 /** Oldest alexa-ai build this wrapper is known to work with. */
-const MIN_ENGINE_VERSION = "2.1.1";
+const MIN_ENGINE_VERSION = "2.2.0";
 
 /** Every engine method this file calls. Checked once at startup. */
 const REQUIRED_METHODS = [
