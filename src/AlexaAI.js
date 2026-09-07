@@ -596,27 +596,38 @@ class AlexaAI {
     /**
      * Text-to-image.
      *
-     * Two routes, tried in order:
+     * Three routes, tried in order:
      *
-     *   1. `POST /api/text2img` — the classic public API. Fast and returns a
-     *      plain `output_url`, but it is a PAID endpoint: anonymous `tryit-…`
-     *      keys get `{"status": "Out of API credits"}` / "try it exceeded".
-     *   2. The in-chat image tool — the same `generate_image` function call the
-     *      deepai.org web client sends when you press "Create image". This
-     *      works on free chat keys and answers with a `generated_image` packet
-     *      carrying a `share_url`.
+     *   1. `POST /api/text2img` — the classic public API, returns
+     *      `share_url` / `output_url`. With a Pro key this always works.
+     *      With an anonymous `tryit-…` key the request is automatically sent
+     *      in the exact browser shape (`generation_source=chat` + size +
+     *      `quality=true`), because a bare `{ text }` form is refused with
+     *      "Please try this model on deepai.org". Anonymous keys are also
+     *      single-use, so a fresh one is minted per request.
+     *   2. Anonymous browser-style retry — when a registered (non-Pro) key
+     *      is refused with 402 "Pro members in good standing", the engine
+     *      retries once with a fresh anonymous key, exactly like the
+     *      deepai.org site does for logged-out visitors. Disable with
+     *      `{ noAnonymousFallback: true }`.
+     *   3. The legacy in-chat image tool — a `generate_image` function-call
+     *      message sent to the chat endpoint. Current models usually answer
+     *      in prose ("I can't generate images") because 2025+ deepai.org
+     *      executes that tool client-side, but the route is kept for
+     *      model versions that still honor it.
      *
-     * Either way the result is normalised to `{ ok, url, id, error, via }`.
-     * Every failure is returned, never thrown, so a bot command can simply
-     * check `result.ok`.
+     * Either way the result is normalised to `{ ok, url, id, error, via }`
+     * (`via` is 'api' | 'anonymous' | 'chat'). Every failure is returned,
+     * never thrown, so a bot command can simply check `result.ok`.
      *
      * @param {string} prompt
      * @param {object} [opts]
-     * @param {string} [opts.aspectRatio='1:1']   in-chat tool only ('1:1', '16:9', '9:16'…)
+     * @param {string} [opts.aspectRatio='1:1']   '1:1', '16:9', '9:16', '4:3', '3:4'
      * @param {number} [opts.width] / [opts.height]  /api/text2img only
-     * @param {string} [opts.image_generator_version]  /api/text2img only
+     * @param {string} [opts.image_generator_version]  /api/text2img only ('hd', 'standard', 'genius')
      * @param {boolean} [opts.chatToolOnly]     skip /api/text2img
      * @param {boolean} [opts.apiOnly]          skip the in-chat tool
+     * @param {boolean} [opts.noAnonymousFallback]  skip route 2
      * @param {AbortSignal} [opts.signal]
      * @returns {Promise<{ok:boolean, url:string|null, id:string|null, error:string|null, message?:string, via:string|null, raw?:any}>}
      */
@@ -625,25 +636,54 @@ class AlexaAI {
         if (!text) {
             return { ok: false, url: null, id: null, error: 'VALIDATION_ERROR', message: 'generateImage(): prompt is required', via: null };
         }
-        const { aspectRatio, chatToolOnly, apiOnly, signal, ...apiFields } = opts || {};
+        const { aspectRatio, chatToolOnly, apiOnly, noAnonymousFallback, signal, ...apiFields } = opts || {};
         const errors = [];
+        let quotaRefused = false;
 
         // ---- 1. classic /api/text2img -------------------------------------
+        // With an anonymous tryit key we speak the exact browser dialect
+        // (generation_source + size/quality fields) — a bare { text } form
+        // is refused with "Please try this model on deepai.org".
         if (!chatToolOnly) {
             try {
-                const data = await this.client.text2img(text, apiFields, { signal });
+                const extra = this.client.usingTryItKey
+                    ? AlexaAI._browserImageFields(aspectRatio || '1:1', apiFields)
+                    : apiFields;
+                const data = await this.client.text2img(text, extra, { signal });
                 const url = AlexaAI._outputUrl(data);
                 if (url) return { ok: true, url, id: data.id || null, error: null, via: 'api', raw: data };
                 errors.push('text2img: no output_url in response');
             } catch (err) {
                 errors.push(`text2img: ${err.message}`);
+                if (err instanceof QuotaExceededError) quotaRefused = true;
                 if (err.code === 'ABORTED') {
                     return { ok: false, url: null, id: null, error: 'ABORTED', message: err.message, via: null };
                 }
             }
         }
 
-        // ---- 2. the chat image tool (works on free chat keys) ---------------
+        // ---- 2. anonymous browser-style retry ------------------------------
+        // A registered key without Pro gets 402 "APIs are only available for
+        // Pro members in good standing". deepai.org itself keeps working for
+        // such visitors by falling back to a fresh anonymous key, so we do
+        // the same: one retry in the full browser shape.
+        if (quotaRefused && !noAnonymousFallback && !this.client.usingTryItKey) {
+            try {
+                const extra = AlexaAI._browserImageFields(aspectRatio || '1:1', apiFields);
+                const data = await this.client.runApiWithTryItKey(
+                    this.client.config.imageModel || 'text2img',
+                    { text, ...extra },
+                    { signal }
+                );
+                const url = AlexaAI._outputUrl(data);
+                if (url) return { ok: true, url, id: data.id || null, error: null, via: 'anonymous', raw: data };
+                errors.push('anonymous text2img: no output_url in response');
+            } catch (err) {
+                errors.push(`anonymous text2img: ${err.message}`);
+            }
+        }
+
+        // ---- 3. the chat image tool (legacy; model-side tool) --------------
         if (!apiOnly) {
             try {
                 const answer = await this.client.chatDetailed(
@@ -666,9 +706,40 @@ class AlexaAI {
             ok: false,
             url: null,
             id: null,
-            error: /credits|exceeded|paid|api-key|api key/i.test(message) ? 'DEEPAI_QUOTA_EXCEEDED' : 'IMAGE_FAILED',
+            error: quotaRefused || /credits|exceeded|paid|pro members|api-key|api key/i.test(message)
+                ? 'DEEPAI_QUOTA_EXCEEDED'
+                : 'IMAGE_FAILED',
             message,
             via: null,
+        };
+    }
+
+    /**
+     * Fields the deepai.org client sends when it presses the in-chat "Create
+     * image" button (maybeHandleImageTool): the aspect ratio is translated
+     * to pixel sizes, generation runs in "hd" with quality=true, and the
+     * request is tagged generation_source=chat. Without these fields the
+     * API refuses anonymous keys ("Please try this model on deepai.org").
+     *
+     * @param {string} aspectRatio '1:1' | '16:9' | '9:16' | '4:3' | '3:4'
+     * @param {object} [overrides] explicit width/height/image_generator_version win
+     * @private
+     */
+    static _browserImageFields(aspectRatio, overrides = {}) {
+        const map = {
+            '16:9': [832, 448],
+            '4:3': [768, 576],
+            '1:1': [640, 640],
+            '3:4': [576, 768],
+            '9:16': [448, 832],
+        };
+        const [width, height] = map[String(aspectRatio || '1:1')] || map['1:1'];
+        return {
+            generation_source: 'chat',
+            width: overrides.width ?? width,
+            height: overrides.height ?? height,
+            image_generator_version: overrides.image_generator_version ?? 'hd',
+            quality: 'true',
         };
     }
 
@@ -995,7 +1066,9 @@ class AlexaAI {
     /** @private the image url carried by an /api/* or tool response. */
     static _outputUrl(data) {
         if (!data || typeof data !== 'object') return null;
-        const url = data.output_url || data.share_url || data.url || (Array.isArray(data.output) ? data.output[0] : null);
+        // The live API prefers share_url (stable, public) over output_url —
+        // same order as the browser client: `json.share_url || json.output_url`.
+        const url = data.share_url || data.output_url || data.url || (Array.isArray(data.output) ? data.output[0] : null);
         return typeof url === 'string' && url ? url : null;
     }
 

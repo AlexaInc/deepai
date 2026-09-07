@@ -71,7 +71,7 @@ class DeepAIClient {
             return true;
         }
         if (this.config.autoKeyRotation) {
-            const fresh = DeepAIClient.generateTryItKey();
+            const fresh = DeepAIClient.generateTryItKey(this.config.userAgent);
             this._keys.push(fresh);
             this._keyIndex = this._keys.length - 1;
             if (this.config.debug) this.log.warn?.('[AlexaAI] Minted a fresh anonymous DeepAI key');
@@ -82,18 +82,90 @@ class DeepAIClient {
 
     /**
      * Anonymous "try it" key in the shape deepai.org generates in-browser:
-     * `tryit-<10 digits>-<32 hex>`.
+     * `tryit-<digits>-<32 hex>`.
+     *
+     * IMPORTANT — the hex part is NOT random. deepai.org's client computes
+     *      H(UA + H(UA + H(UA + digits + SALT)))
+     * (with the site's custom hash H and the salt
+     *  "hackers_become_a_little_stinkier_every_time_they_hack") and the
+     * server recomputes it from the request's User-Agent header. A key with
+     * random hex is rejected with
+     *      401 {"status":"Please pass a valid Api-Key ..."}
+     * which is why image generation used to fail on every tryit key.
+     *
+     * Anonymous keys are also SINGLE-USE: one key == one request. The client
+     * therefore mints a fresh key per request whenever the active key is an
+     * anonymous one (see `headers()`).
+     *
+     * @param {string} [userAgent] the User-Agent the request will carry
+     * @returns {string}
      */
-    static generateTryItKey() {
-        const digits = Array.from({ length: 10 }, () => Math.floor(Math.random() * 10)).join('');
-        const hex = Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
-        return `tryit-${digits}-${hex}`;
+    static generateTryItKey(userAgent) {
+        const ua = String(
+            userAgent ||
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+        );
+        const digits = String(Math.round(Math.random() * 100000000000));
+        const salt = 'hackers_become_a_little_stinkier_every_time_they_hack';
+        const H = DeepAIClient._islandHash;
+        const hash = H(ua + H(ua + H(ua + digits + salt)));
+        return `tryit-${digits}-${hash}`;
     }
 
-    /** Browser-identical headers. DeepAI rejects requests without an origin. */
+    /** True for anonymous `tryit-…` keys (single-use, hash-validated). */
+    static isTryItKey(key) {
+        return /^tryit-\d+-[0-9a-f]{32}$/i.test(String(key || ''));
+    }
+
+    /**
+     * deepai.org's hand-rolled MD5 variant, ported verbatim from the live
+     * site client (generateIslandKey). Deterministic so the server can
+     * recompute and verify the tryit key hash from the User-Agent header.
+     * @private
+     */
+    static _islandHash(input) {
+        const a = [];
+        for (let b = 0; 64 > b; ) a[b] = 0 | (4294967296 * Math.sin(++b % Math.PI));
+        let d, e, f, g = [(d = 1732584193), (e = 4023233417), ~d, ~e], h = [];
+        const l = unescape(encodeURI(input)) + '\u0080';
+        let k = l.length;
+        let c = (--k / 4 + 2) | 15;
+        for (h[--c] = 8 * k; ~k; ) h[k >> 2] |= l.charCodeAt(k) << (8 * k--);
+        for (let b = 0, m = 0; b < c; b += 16) {
+            for (k = g; 64 > m; k = [ (f = k[3]), d + (((f = k[0] + [d & e | ~d & f, f & d | ~f & e, d ^ e ^ f, e ^ (d | ~f)][(k = m >> 4)] + a[m] + ~~h[b | [m, 5 * m + 1, 3 * m + 5, 7 * m][k] & 15]) << (k = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21][4 * k + (m++ % 4)])) | (f >>> -k)), d, e ]) {
+                d = k[1] | 0;
+                e = k[2];
+            }
+            for (m = 4; m; ) g[--m] += k[m];
+        }
+        let result = '';
+        for (let i = 0; 32 > i; ) result += ((g[i >> 3] >> 4 * (1 ^ i++)) & 15).toString(16);
+        return result.split('').reverse().join('');
+    }
+
+
+    /** True when the active key is an anonymous single-use `tryit-…` key. */
+    get usingTryItKey() {
+        return DeepAIClient.isTryItKey(this.apiKey);
+    }
+
+    /**
+     * Browser-identical headers. DeepAI rejects requests without an origin.
+     *
+     * Anonymous `tryit-…` keys are validated against a hash of the
+     * User-Agent AND are single-use (one key == one request), exactly like
+     * the deepai.org client, which calls generateIslandKey() before every
+     * fetch. So whenever the active key is anonymous we mint a fresh valid
+     * one here instead of reusing the stale key.
+     */
     headers(extra = {}) {
+        let apiKey = this.apiKey;
+        if (DeepAIClient.isTryItKey(apiKey)) {
+            apiKey = DeepAIClient.generateTryItKey(this.config.userAgent);
+            this._keys[this._keyIndex] = apiKey;
+        }
         return {
-            'api-key': this.apiKey,
+            'api-key': apiKey,
             Origin: this.config.origin,
             Referer: `${this.config.origin}/`,
             'User-Agent': this.config.userAgent,
@@ -561,7 +633,7 @@ class DeepAIClient {
         if (data?.err) {
             throw DeepAIClient._toError(200, JSON.stringify(data), String(data.err));
         }
-        if (typeof data?.status === 'string' && !data.output_url && !data.output && !data.id) {
+        if (typeof data?.status === 'string' && !data.share_url && !data.output_url && !data.output && !data.id) {
             throw DeepAIClient._toError(200, JSON.stringify(data), data.status);
         }
         return data;
@@ -570,6 +642,26 @@ class DeepAIClient {
     /** Text-to-image (`/api/text2img`). Returns `{ id, output_url }`. */
     async text2img(text, extra = {}, options = {}) {
         return this.runApi(this.config.imageModel || STANDARD_APIS.text2img, { text, ...extra }, options);
+    }
+
+    /**
+     * Run a classic `/api/<name>` call with a one-shot anonymous tryit key,
+     * regardless of the configured key. This mirrors what deepai.org does
+     * for logged-out visitors (generateIslandKey() per request) and is the
+     * fallback path when a registered key is refused ("Pro members only").
+     * A fresh, correctly-hashed key is minted for this single request.
+     */
+    async runApiWithTryItKey(name, fields = {}, options = {}) {
+        const previousKeys = this._keys;
+        const previousIndex = this._keyIndex;
+        this._keys = [DeepAIClient.generateTryItKey(this.config.userAgent)];
+        this._keyIndex = 0;
+        try {
+            return await this.runApi(name, fields, options);
+        } finally {
+            this._keys = previousKeys;
+            this._keyIndex = previousIndex;
+        }
     }
 
     /** Prompt-driven image edit (`/api/image-editor`). */
@@ -711,7 +803,9 @@ class DeepAIClient {
     }
 
     static _isRefusal(status) {
-        return /exceeded|paid|credits|api-key|api key|login|not allowed|forbidden|unauthori[sz]ed/i.test(status);
+        return /exceeded|paid|credits|api-key|api key|login|not allowed|forbidden|unauthori[sz]ed|pro members|good standing|model only available|please try this model/i.test(
+            status
+        );
     }
 
     /** @private magic-number sniff so uploads carry a real content type. */
@@ -749,6 +843,14 @@ class DeepAIClient {
             'api key',
             'api-key',
             'please login',
+            // statuses the live API returns as of 2026 (see the deepai.org
+            // client's own error taxonomy in maybeHandleImageTool):
+            'pro members', // "APIs are only available for Pro members in good standing…"
+            'good standing',
+            'model only available', // "model only available to (logged in|paid) users"
+            'signed in try-it quota exceeded',
+            'insufficient_credits',
+            'pro user out of credits',
         ];
         if (quotaHints.some((h) => lowered.includes(h))) {
             return new QuotaExceededError(`DeepAI refused the request: ${msg}`, { status, body });

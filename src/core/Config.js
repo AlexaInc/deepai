@@ -42,7 +42,12 @@ class Config {
         const opts = options || {};
 
         // ---- Accept several aliases so the host bot can stay terse ----------
-        const key = opts.key || opts.apiKey || opts.deepaiKey || process.env.DEEPAI_API_KEY;
+        const key =
+            opts.key ||
+            opts.apiKey ||
+            opts.deepaiKey ||
+            process.env.DEEPAI_KEY ||
+            process.env.DEEPAI_API_KEY;
         const postgresUrl =
             opts.postgresUrl ||
             opts.postgresURL ||
@@ -169,7 +174,7 @@ class Config {
         this.retryDelay = Config._int(opts.retryDelay, 800, 0, 30000);
         this.userAgent =
             opts.userAgent ||
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
 
         // ---- Database --------------------------------------------------------
         this.autoMigrate = opts.autoMigrate !== false; // default true

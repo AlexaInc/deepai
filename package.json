@@ -1,6 +1,6 @@
 {
   "name": "alexa-ai",
-  "version": "2.1.2",
+  "version": "2.2.0",
   "description": "AI engine for the Alexa WhatsApp bot: DeepAI-powered chat with PostgreSQL-backed long-term memory, cross-chat identity (@lid <-> phone), vision/OCR, image generation and web search.",
   "main": "index.js",
   "scripts": {

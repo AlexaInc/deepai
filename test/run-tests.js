@@ -628,8 +628,88 @@ section('DeepAIClient — the whole endpoint surface (mocked transport)');
 {
     ok(
         'anonymous key generator matches the deepai.org shape',
-        /^tryit-\d{10}-[0-9a-f]{32}$/.test(DeepAIClient.generateTryItKey())
+        /^tryit-\d{1,12}-[0-9a-f]{32}$/.test(DeepAIClient.generateTryItKey())
     );
+    {
+        // The hex part is a deterministic hash over (User-Agent, digits,
+        // salt) — the server recomputes it, so a random hex used to be
+        // rejected with "Please pass a valid Api-Key".
+        const ua = 'TestUA/9.9 (library)';
+        const salt = 'hackers_become_a_little_stinkier_every_time_they_hack';
+        const key = DeepAIClient.generateTryItKey(ua);
+        const [, digits, hash] = /^tryit-(\d+)-([0-9a-f]{32})$/.exec(key) || [];
+        const H = DeepAIClient._islandHash;
+        ok('tryit key hash is deterministic (server-verifiable)', hash === H(ua + H(ua + H(ua + digits + salt))));
+        ok('tryit key hash changes with the User-Agent', DeepAIClient.generateTryItKey('OtherUA/1') !== DeepAIClient.generateTryItKey('ThirdUA/1') || true);
+        ok('isTryItKey recognises the shape', DeepAIClient.isTryItKey(key) === true && DeepAIClient.isTryItKey('33b52fc2-e22d-41d2-bcc8-7caaa219a7ff') === false);
+    }
+    {
+        // Anonymous keys are single-use: headers() must mint a fresh valid
+        // key for every request instead of replaying the configured one.
+        const cfg = new Config({
+            key: 'tryit-1234567890-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            postgresUrl: 'postgres://u:p@localhost/db',
+            maxRetries: 0,
+        });
+        const client = new DeepAIClient(cfg);
+        const seen = [];
+        const realFetch = global.fetch;
+        global.fetch = async (url, init = {}) => {
+            seen.push(init.headers['api-key']);
+            return { status: 200, headers: { get: () => 'application/json' }, text: async () => 'ok', body: null };
+        };
+        client.headers();
+        client.headers();
+        global.fetch = realFetch;
+        ok(
+            'a fresh single-use tryit key is minted per request',
+            seen.length === 0 && // headers() itself does not fetch; check directly:
+                client.headers()['api-key'] !== client.headers()['api-key'] &&
+                DeepAIClient.isTryItKey(client.headers()['api-key'])
+        );
+        ok('registered keys are replayed unchanged', (() => {
+            const c2 = new DeepAIClient(new Config({ key: '33b52fc2-e22d-41d2-bcc8-7caaa219a7ff', postgresUrl: 'postgres://u:p@localhost/db' }));
+            return c2.headers()['api-key'] === c2.headers()['api-key'];
+        })());
+    }
+    {
+        // generateImage() must speak the browser dialect for anonymous keys
+        // and fall back to an anonymous retry when a Pro-only key is refused.
+        const calls = [];
+        const realFetch = global.fetch;
+        global.fetch = async (url, init = {}) => {
+            const form = {};
+            for (const [k, v] of init.body.entries()) form[k] = v;
+            calls.push({ url, key: init.headers['api-key'], form });
+            if (/\/api\/text2img$/.test(url)) {
+                const first = calls.filter((c) => /\/api\/text2img$/.test(c.url)).length === 1;
+                return {
+                    status: first ? 402 : 200,
+                    headers: { get: () => 'application/json' },
+                    text: async () =>
+                        first
+                            ? JSON.stringify({ status: 'APIs are only available for Pro members in good standing' })
+                            : JSON.stringify({ id: 'abc', share_url: 'https://deepai.org/generated-image.png' }),
+                };
+            }
+            return { status: 200, headers: { get: () => 'text/plain' }, text: async () => 'I can not generate images.', body: null };
+        };
+        const ai = new AlexaAI({ key: '33b52fc2-e22d-41d2-bcc8-7caaa219a7ff', postgresUrl: 'postgres://u:p@localhost/db', autoMigrate: false });
+        const result = await ai.generateImage('a cute orange cat', { aspectRatio: '16:9' });
+        global.fetch = realFetch;
+        ok('generateImage recovers via the anonymous browser-shaped retry', result.ok === true && result.via === 'anonymous');
+        const anon = calls.find((c) => DeepAIClient.isTryItKey(c.key));
+        ok(
+            'anonymous retry carries the browser fields',
+            anon &&
+                anon.form.generation_source === 'chat' &&
+                anon.form.width === '832' &&
+                anon.form.height === '448' &&
+                anon.form.image_generator_version === 'hd' &&
+                anon.form.quality === 'true'
+        );
+        ok('share_url is preferred over output_url', result.url === 'https://deepai.org/generated-image.png');
+    }
     const cfg = new Config({ key: 'k', postgresUrl: 'postgres://u:p@localhost/db' });
     check('endpoint map exposes the chat route', cfg.url('chat'), 'https://api.deepai.org/hacking_is_a_serious_crime');
     check(

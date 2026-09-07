@@ -427,14 +427,27 @@ await ai.deepai.runApi('waifu2x', { image: buffer });       // any /api/<name> e
 
 All media arguments accept the same shapes as `chat({ image })`.
 
-**`generateImage()` on a free key.** `POST /api/text2img` is a paid endpoint:
-anonymous keys receive `{"status": "Out of API credits"}`. The engine tries it
-first because it is fast and returns a plain URL; when it is refused, it
-drives the same in-chat `generate_image` tool the deepai.org web client uses,
-which works on free chat keys. The result reports the route that answered
-(`via: 'api' | 'chat'`). Options: `{ apiOnly }`, `{ chatToolOnly }`,
-`{ aspectRatio: '16:9' }` for the chat tool, and `width` / `height` /
-`image_generator_version` for the API.
+**`generateImage()` on a free key.** Three routes are tried, in order:
+
+1. `POST /api/text2img` with your key. Pro keys succeed here immediately.
+   With an anonymous `tryit-…` key the engine automatically sends the exact
+   browser dialect (`generation_source=chat`, `width`/`height` mapped from
+   `aspectRatio`, `image_generator_version=hd`, `quality=true`) and mints a
+   **fresh single-use key per request** — tryit keys are hash-validated
+   against the User-Agent and burned after one request.
+2. If a registered (non-Pro) key is refused with `402 "Pro members in good
+   standing"`, one anonymous browser-shaped retry — the same thing
+   deepai.org does for logged-out visitors. (`noAnonymousFallback: true`
+   disables it.)
+3. The legacy in-chat `generate_image` function call (kept for older model
+   versions; 2025+ models answer in prose because the website now runs this
+   tool client-side).
+
+The result reports the route that answered (`via: 'api' | 'anonymous' |
+'chat'`). Options: `{ apiOnly }`, `{ chatToolOnly }`, `{ noAnonymousFallback }`,
+`{ aspectRatio: '16:9' }`, and `width` / `height` / `image_generator_version`
+for the API. The returned URL prefers `share_url` (public, stable) over
+`output_url`, matching the browser client.
 
 **`summarizeText()`** follows the same pattern — `/api/summarization` first, a
 stateless chat request as the fallback.
@@ -842,9 +855,20 @@ error), and the reply came from DeepAI's own web access. Point
 blocked where the bot runs.
 
 **`generateImage()` returns `{ ok: false, error: 'DEEPAI_QUOTA_EXCEEDED' }`**
-Both routes were refused: `/api/text2img` needs credits and the in-chat image
-tool hit the key's chat quota. Add more keys (`keys: [...]`) or wait for the
-quota to reset. `message` carries DeepAI's exact wording.
+`/api/text2img` is Pro-only for registered keys ("APIs are only available for
+Pro members in good standing"), the anonymous browser-shaped retry was
+refused too (DeepAI soft-blocks free image generation from datacenter IPs
+with "Please try this model on deepai.org" — run the bot from a residential
+IP), and the in-chat tool produced no image. Add a Pro key, more keys
+(`keys: [...]`), or run from a non-datacenter IP. `message` carries DeepAI's
+exact wording for each attempted route.
+
+**`401 "Please pass a valid Api-Key"` with a tryit key** (fixed in 2.2.0)
+Older releases minted `tryit-…` keys with random hex. The server recomputes
+the hash from the request's User-Agent (`H(UA + H(UA + H(UA + digits +
+salt)))`) and rejects anything else. Keys are now minted with the real
+algorithm, and because they are single-use a fresh one is minted per request.
+Keep `userAgent` unchanged between requests if you persist keys.
 
 **Photos are answered with "I can't view images right now"**
 Native vision needs a paid DeepAI key; on a free key only text inside the
