@@ -4,6 +4,22 @@ All notable changes to `alexa-ai` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [2.6.0] — 2026-09-07
+
+### Added
+- **Time-aware conversations.** Previously the replayed history had no
+  timestamps, so a thread from a week ago read like it happened today and the
+  model answered accordingly. Now:
+  - the system prompt carries a live "Today is <weekday, date, time, zone>"
+    line (`timeZone` option, defaults to the server zone);
+  - history turns further apart than `timeGapMinutes` (default 60) carry a
+    bracketed gap marker, e.g. "[about 1 week passed since the previous
+    message]";
+  - the live message carries the same marker when the thread itself was
+    resumed after a long pause.
+  Disable with `historyTimeMarkers: false`. `getHistory()` now returns
+  `createdAt` alongside `role`/`content`.
+
 ## [2.5.0] — 2026-09-07
 
 ### Added

@@ -184,6 +184,13 @@ class Config {
 
         // ---- Conversation / memory tuning -----------------------------------
         this.historyLimit = Config._int(opts.historyLimit, 14, 2, 60);
+        // Time awareness: the prompt carries a "Today is ..." line, and a
+        // gap marker is inserted between history turns that are further
+        // apart than timeGapMinutes, so the model knows how much time has
+        // passed instead of treating a week-old chat as happening today.
+        this.historyTimeMarkers = opts.historyTimeMarkers !== false;
+        this.timeGapMinutes = Config._int(opts.timeGapMinutes, 60, 1, 60 * 24 * 365);
+        this.timeZone = opts.timeZone || process.env.DEEPAI_TIME_ZONE || null; // null = server local
         this.maxMemories = Config._int(opts.maxMemories, 25, 0, 200);
         this.maxMessageLength = Config._int(opts.maxMessageLength, 8000, 100, 100000);
         this.sharedGroupThread = Boolean(opts.sharedGroupThread);

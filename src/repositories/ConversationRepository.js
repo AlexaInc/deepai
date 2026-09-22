@@ -119,7 +119,13 @@ class ConversationRepository {
               ORDER BY created_at ASC, id ASC`,
             [conversationId, limit]
         );
-        return rows.map((r) => ({ role: r.role, content: r.content }));
+        // createdAt rides along so the prompt can carry time-gap markers;
+        // without them a week-old thread reads like it happened just now.
+        return rows.map((r) => ({
+            role: r.role,
+            content: r.content,
+            createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+        }));
     }
 
     async findByContextKey(contextKey) {

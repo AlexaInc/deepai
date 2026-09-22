@@ -931,6 +931,23 @@ refusal asks the vision model for a score instead (`via: 'chat'` — works when
 the key can see images), (c) otherwise returns `error: 'DEEPAI_PRO_REQUIRED'`
 with a clear message. A Pro key makes the real model work.
 
+**The bot thinks last week's chat happened today.** Fixed in 2.6.0. Two
+mechanisms now keep the model time-aware:
+
+1. The system prompt carries a live date line — *"Today is Tuesday, 22
+   September 2026 at 14:05 (Asia/Colombo time)."* — so it can answer
+   date questions and judge how old memories are.
+2. Replayed history carries time-gap markers. When two turns are more than
+   `timeGapMinutes` apart (default 60), the later turn is prefixed with a
+   bracketed note like `[about 1 week passed since the previous message]`,
+   and the same marker is attached to the live message when a thread is
+   resumed after a long pause. The model explicitly knows the old messages
+   are from last week.
+
+Options: `timeGapMinutes` (default 60), `historyTimeMarkers: false` to
+disable markers, `timeZone` (e.g. `'Asia/Colombo'`; defaults to the server's
+zone).
+
 **Always check `result.ok` before sending media.** On failure every helper
 returns `url: null` — passing that straight to Baileys'
 `prepareWAMessageMedia` crashes the bot with

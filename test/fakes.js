@@ -79,7 +79,7 @@ function createFakeDb() {
             return { name: user?.display_name || named?.value || user?.push_name || null };
         }
         if (/^INSERT INTO wa_messages/.test(q)) {
-            const row = { id: seq++, conversation_id: p[0], user_id: p[1], role: p[2], content: p[3] };
+            const row = { id: seq++, conversation_id: p[0], user_id: p[1], role: p[2], content: p[3], created_at: new Date().toISOString() };
             state.messages.push(row);
             return row;
         }
@@ -97,7 +97,7 @@ function createFakeDb() {
         if (/FROM wa_messages/.test(q)) {
             return state.messages
                 .filter((m) => m.conversation_id === p[0])
-                .map((m) => ({ role: m.role, content: m.content }));
+                .map((m) => ({ role: m.role, content: m.content, created_at: m.created_at }));
         }
         if (/FROM wa_memories/.test(q)) {
             return state.memories.filter((m) => m.user_id === p[0]).map((m) => ({ key: m.key, value: m.value }));

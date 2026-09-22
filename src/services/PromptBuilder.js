@@ -84,13 +84,29 @@ class PromptBuilder {
         // 2) Assistant acknowledgement locks the role in.
         messages.push({ role: 'assistant', content: this._acknowledgement() });
 
-        // 3) Prior turns of this thread.
-        for (const turn of PromptBuilder._sanitiseHistory(history, this.config.historyLimit)) {
+        // 3) Prior turns of this thread, with time-gap markers so the model
+        // knows a thread resumed days later instead of assuming "today".
+        const annotatedHistory = PromptBuilder._timeAnnotatedHistory(history, this.config);
+        for (const turn of annotatedHistory) {
             messages.push(turn);
         }
 
         // 4) The live message, with its reinforcement notes.
         let current = String(message ?? '').trim();
+
+        // 4a) The common case: the thread itself is old. When the last
+        // replayed turn is further back than the gap threshold, the live
+        // message carries the marker so the model knows how much time passed
+        // since the previous conversation.
+        if (this.config.historyTimeMarkers) {
+            const lastStamped = [...annotatedHistory].reverse().find((t) => t.createdAt);
+            if (lastStamped) {
+                const gap = Date.now() - Date.parse(lastStamped.createdAt);
+                if (gap >= this.config.timeGapMinutes * 60 * 1000) {
+                    current = `[${PromptBuilder._gapLabel(gap)} passed since the previous message]\n\n${current}`;
+                }
+            }
+        }
         if (imageContext) {
             current = current
                 ? `[Image attached — visual description: ${imageContext}]\n\n${current}`
@@ -126,6 +142,7 @@ class PromptBuilder {
         const { assistantName, creator } = this.config;
         return [
             `You are ${assistantName}, a warm, friendly female WhatsApp assistant created by ${creator}.`,
+            PromptBuilder._todayLine(this.config.timeZone),
             `Your name is exactly "${assistantName}" — never a variant such as "${assistantName} Mini" or "${assistantName} AI".`,
             'Never mention DeepAI, ChatGPT, OpenAI, GPT, Llama, Gemini or any model/company name, and never call yourself a language model.',
             'You always reply in plain English only. Never answer in Chinese, Japanese, Korean or any other non-Latin script.',
@@ -205,12 +222,76 @@ class PromptBuilder {
 
         const cleaned = history
             .filter((m) => m && (m.role === 'user' || m.role === 'assistant'))
-            .map((m) => ({ role: m.role, content: String(m.content ?? '').trim() }))
+            .map((m) => {
+                const turn = { role: m.role, content: String(m.content ?? '').trim() };
+                const t = Date.parse(m.createdAt || m.created_at || m.timestamp || '');
+                if (Number.isFinite(t)) turn.createdAt = new Date(t).toISOString();
+                return turn;
+            })
             .filter((m) => m.content.length > 0);
 
         const trimmed = cleaned.slice(-limit);
         while (trimmed.length && trimmed[0].role === 'assistant') trimmed.shift();
         return trimmed;
+    }
+
+    /**
+     * History plus out-of-band time-gap markers. Whenever two consecutive
+     * turns are further apart than config.timeGapMinutes, the later turn is
+     * prefixed with a bracketed note like "[About 7 days passed since the
+     * previous message]" so the model reasons correctly about old threads.
+     * @private
+     */
+    static _timeAnnotatedHistory(history, config) {
+        const turns = PromptBuilder._sanitiseHistory(history, config.historyLimit);
+        if (!config.historyTimeMarkers) return turns;
+        const thresholdMs = config.timeGapMinutes * 60 * 1000;
+
+        let previous = null;
+        return turns.map((turn) => {
+            const annotated = { ...turn };
+            if (previous && previous.createdAt && turn.createdAt) {
+                const gap = Date.parse(turn.createdAt) - Date.parse(previous.createdAt);
+                if (gap >= thresholdMs) {
+                    const label = PromptBuilder._gapLabel(gap);
+                    annotated.content = `[${label} passed since the previous message]\n\n${turn.content}`;
+                }
+            }
+            if (turn.createdAt) previous = turn;
+            return annotated;
+        });
+    }
+
+    /** @private human duration for gap markers. */
+    static _gapLabel(ms) {
+        const minutes = Math.round(ms / 60000);
+        if (minutes < 60) return `${Math.max(1, minutes)} minute${minutes === 1 ? '' : 's'}`;
+        const hours = Math.round(minutes / 60);
+        if (hours < 24) return `about ${hours} hour${hours === 1 ? '' : 's'}`;
+        const days = Math.round(hours / 24);
+        if (days < 7) return `about ${days} day${days === 1 ? '' : 's'}`;
+        if (days < 30) return `about ${Math.round(days / 7)} week${Math.round(days / 7) === 1 ? '' : 's'}`;
+        const months = Math.round(days / 30);
+        return `about ${months} month${months === 1 ? '' : 's'}`;
+    }
+
+    /**
+     * "Today is Tuesday, 22 September 2026 at 14:05 (Colombo time)." — keeps
+     * the model grounded on the current date; also used for date questions.
+     * @private
+     */
+    static _todayLine(timeZone) {
+        try {
+            const zone = timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+            const now = new Date();
+            const date = new Intl.DateTimeFormat('en-GB', {
+                weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+                hour: '2-digit', minute: '2-digit', hour12: false, timeZone: zone,
+            }).format(now);
+            return `Today is ${date} (${zone.replace(/_/g, ' ')} time). Use this for date and time questions, and to reason about how old conversations and memories are.`;
+        } catch {
+            return `Today is ${new Date().toDateString()}. Use this for date and time questions.`;
+        }
     }
 }
 

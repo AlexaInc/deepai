@@ -328,6 +328,29 @@ section('PromptBuilder — persona delivery');
     ok('group context injected', persona.content.includes('GROUP'));
     ok('group turn states it is the same person as the DM', persona.content.includes('SAME person'));
     check('third turn is the assistant ack', msgs[2].role, 'assistant');
+
+    // time awareness: current-date line + gap markers
+    ok('system digest carries a Today line', /Today is .+ time\)\. Use this for date/.test(msgs[0].content));
+    {
+        const now = Date.now();
+        const aged = pb.build({
+            message: 'hi again',
+            history: [
+                { role: 'user', content: 'old question', createdAt: new Date(now - 7 * 86400000).toISOString() },
+                { role: 'assistant', content: 'old answer', createdAt: new Date(now - 7 * 86400000 + 30000).toISOString() },
+                { role: 'user', content: 'recent question', createdAt: new Date(now - 60000).toISOString() },
+            ],
+        });
+        const turns = aged.slice(3).filter((m) => m.role === 'user' || m.role === 'assistant');
+        ok('week-long gap gets a marker', turns.some((m) => m.content.includes('[about 1 week passed since the previous message]')));
+        ok('short gap gets no marker', !turns.some((m) => /passed since/.test(m.content) && m.content.includes('old answer')));
+        const off = new PromptBuilder(new Config({ key: 'k', postgresUrl: 'postgres://u:p@localhost/db', historyTimeMarkers: false }));
+        const plain = off.build({
+            message: 'hi',
+            history: [{ role: 'user', content: 'old question', createdAt: new Date(now - 7 * 86400000).toISOString() }, { role: 'user', content: 'recent', createdAt: new Date(now).toISOString() }],
+        });
+        ok('markers can be disabled', !plain.slice(3).some((m) => /passed since/.test(m.content)));
+    }
     ok('last turn contains the live message', msgs[msgs.length - 1].content.endsWith('hello'));
     ok('recall note precedes the live message', msgs[msgs.length - 1].content.includes('Remembered facts'));
     ok('recall note lists known facts', msgs[msgs.length - 1].content.includes('name=Nimal'));
@@ -980,6 +1003,19 @@ async function endToEndTests() {
         const zh2 = await ai.chat({ message: 'hello', userId: '78151912841263@lid' });
         ok('unrecoverable reply carries no CJK', !/[\u4E00-\u9FFF]/.test(zh2.text));
         ok('unrecoverable reply is non-empty', zh2.text.trim().length > 0);
+
+        // 9. A week-old thread is replayed with a time-gap marker, so the
+        // model knows the old messages are from last week, not today.
+        deepai.push('That was a week ago! Today is a new day.');
+        for (const m of db.state.messages) {
+            if (m.conversation_id && m.created_at) m.created_at = new Date(Date.now() - 7 * 86400000).toISOString();
+        }
+        const agedReply = await ai.chat({ message: 'do you remember me?', userId: '78151912841263@lid' });
+        const lastCall = deepai.calls[deepai.calls.length - 1];
+        const sentHistory = lastCall.fields.chatHistory || '';
+        ok('aged thread sends a gap marker', /passed since the previous message/.test(sentHistory));
+        ok('gap marker says roughly a week', /about 1 week/.test(sentHistory));
+        ok('reply is not corrupted by the marker', typeof agedReply.text === 'string' && agedReply.text.length > 0);
     } finally {
         deepai.restore();
     }
